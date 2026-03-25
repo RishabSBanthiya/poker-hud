@@ -17,7 +17,10 @@ import cv2
 import numpy as np
 
 from src.detection.card import Card, Rank, Suit
-from src.detection.generate_templates import generate_all_templates, generate_card_template
+from src.detection.generate_templates import (
+    generate_all_templates,
+    generate_card_template,
+)
 from src.detection.template_matcher import TemplateMatcher
 
 logger = logging.getLogger(__name__)
