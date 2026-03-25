@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "poker-hud"
+version = "0.1.0"
+description = "macOS poker HUD — screen capture, card detection, opponent stats, GTO recommendations"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pyobjc-framework-ScreenCaptureKit>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "structlog>=23.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.1",
+    "black>=23.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "requires_screen_recording: marks tests that need macOS Screen Recording permission",
+    "requires_gui: marks tests that need a GUI environment",
+]
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.black]
+target-version = ["py311"]
+line-length = 88
