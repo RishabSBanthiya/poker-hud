@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-
 from src.capture.screen_capture import (
     CaptureRegion,
     ScreenCapture,
@@ -80,6 +79,11 @@ class TestScreenCaptureInit:
         capture.region = None
         assert capture.region is None
 
+    def test_init_with_custom_retries(self) -> None:
+        """ScreenCapture accepts a custom max_retries value."""
+        capture = ScreenCapture(max_retries=5)
+        assert capture._max_retries == 5
+
 
 class TestValidateFrame:
     """Tests for the validate_frame utility function."""
@@ -141,7 +145,6 @@ class TestScreenCaptureFrame:
         ), patch.object(
             capture, "_convert_to_bgr", return_value=expected_frame
         ):
-            # Patch the import inside capture_frame
             mock_sck = MagicMock()
             with patch.dict(
                 "sys.modules",
@@ -181,6 +184,103 @@ class TestScreenCaptureFrame:
                 frame = capture.capture_frame()
 
         assert frame.shape == (480, 640, 3)
+
+    def test_retry_on_transient_failure(self) -> None:
+        """capture_frame retries on transient ScreenCaptureError."""
+        capture = ScreenCapture(max_retries=3)
+        expected_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        call_count = 0
+
+        def mock_get_display(*args):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ScreenCaptureError("transient error")
+            return MagicMock()
+
+        with patch.object(
+            capture, "_get_display", side_effect=mock_get_display
+        ), patch.object(
+            capture, "_build_config", return_value=MagicMock()
+        ), patch.object(
+            capture, "_capture_raw_frame", return_value=MagicMock()
+        ), patch.object(
+            capture, "_convert_to_bgr", return_value=expected_frame
+        ):
+            mock_sck = MagicMock()
+            with patch.dict(
+                "sys.modules",
+                {"ScreenCaptureKit": mock_sck},
+            ):
+                frame = capture.capture_frame()
+
+        assert validate_frame(frame)
+        assert call_count == 3
+
+    def test_permission_error_not_retried(self) -> None:
+        """Permission errors are raised immediately without retrying."""
+        capture = ScreenCapture(max_retries=3)
+
+        with patch.object(
+            capture,
+            "_get_display",
+            side_effect=ScreenRecordingPermissionError("denied"),
+        ):
+            mock_sck = MagicMock()
+            with patch.dict(
+                "sys.modules",
+                {"ScreenCaptureKit": mock_sck},
+            ):
+                with pytest.raises(ScreenRecordingPermissionError):
+                    capture.capture_frame()
+
+    def test_all_retries_exhausted_raises(self) -> None:
+        """ScreenCaptureError is raised when all retries fail."""
+        capture = ScreenCapture(max_retries=2)
+
+        with patch.object(
+            capture,
+            "_get_display",
+            side_effect=ScreenCaptureError("persistent error"),
+        ):
+            mock_sck = MagicMock()
+            with patch.dict(
+                "sys.modules",
+                {"ScreenCaptureKit": mock_sck},
+            ):
+                with pytest.raises(ScreenCaptureError, match="2 attempts"):
+                    capture.capture_frame()
+
+
+class TestCropToRegion:
+    """Tests for the _crop_to_region fallback method."""
+
+    def test_crop_extracts_correct_subregion(self) -> None:
+        """Crop returns the exact pixels from the requested region."""
+        capture = ScreenCapture(
+            region=CaptureRegion(x=10, y=20, width=50, height=30)
+        )
+        frame = np.arange(100 * 200 * 3, dtype=np.uint8).reshape(100, 200, 3)
+        cropped = capture._crop_to_region(frame)
+        assert cropped.shape == (30, 50, 3)
+        np.testing.assert_array_equal(cropped, frame[20:50, 10:60])
+
+    def test_crop_clamps_out_of_bounds(self) -> None:
+        """Crop clamps when region extends beyond frame."""
+        capture = ScreenCapture(
+            region=CaptureRegion(x=90, y=90, width=50, height=50)
+        )
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        cropped = capture._crop_to_region(frame)
+        assert cropped.shape == (10, 10, 3)
+
+    def test_crop_noop_without_region(self) -> None:
+        """Crop returns the original frame when no region is set."""
+        capture = ScreenCapture()
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        result = capture._crop_to_region(frame)
+        np.testing.assert_array_equal(result, frame)
 
 
 @pytest.mark.requires_screen_recording

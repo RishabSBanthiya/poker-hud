@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_MAX_RETRIES = 3
+_RETRY_DELAY_SECONDS = 0.1
 
 
 @dataclass
@@ -63,6 +67,7 @@ class ScreenCapture:
     Args:
         region: Optional capture region. If None, captures the full primary display.
         display_id: Optional display ID to capture. If None, uses the primary display.
+        max_retries: Number of retry attempts on transient failures.
 
     Example:
         >>> capture = ScreenCapture()
@@ -75,9 +80,11 @@ class ScreenCapture:
         self,
         region: Optional[CaptureRegion] = None,
         display_id: Optional[int] = None,
+        max_retries: int = _MAX_RETRIES,
     ) -> None:
         self._region = region
         self._display_id = display_id
+        self._max_retries = max_retries
 
     @property
     def region(self) -> Optional[CaptureRegion]:
@@ -96,6 +103,9 @@ class ScreenCapture:
     def capture_frame(self) -> np.ndarray:
         """Capture a single frame from the screen.
 
+        Includes retry logic for transient failures. Permission errors are
+        raised immediately without retrying.
+
         Returns:
             A numpy array with shape (height, width, 3), dtype uint8, in BGR
             color order (OpenCV-compatible).
@@ -103,7 +113,7 @@ class ScreenCapture:
         Raises:
             ScreenRecordingPermissionError: If Screen Recording permission is
                 not granted in macOS System Preferences.
-            ScreenCaptureError: If capture fails for any other reason.
+            ScreenCaptureError: If capture fails after all retries.
         """
         try:
             from ScreenCaptureKit import (  # type: ignore[import-untyped]
@@ -116,10 +126,77 @@ class ScreenCapture:
                 "Install with: pip install pyobjc-framework-ScreenCaptureKit"
             ) from exc
 
-        display = self._get_display(SCShareableContent)
-        config = self._build_config(SCStreamConfiguration, display)
-        raw_frame = self._capture_raw_frame(display, config)
-        return self._convert_to_bgr(raw_frame)
+        last_error: Optional[Exception] = None
+        for attempt in range(self._max_retries):
+            try:
+                display = self._get_display(SCShareableContent)
+                config = self._build_config(SCStreamConfiguration, display)
+                raw_frame = self._capture_raw_frame(display, config)
+                frame = self._convert_to_bgr(raw_frame)
+
+                if self._region is not None:
+                    h, w = frame.shape[:2]
+                    # Only crop if the frame is larger than the
+                    # requested region (i.e. ScreenCaptureKit did
+                    # not apply sourceRect for us).
+                    if (
+                        w != self._region.width
+                        or h != self._region.height
+                    ):
+                        frame = self._crop_to_region(frame)
+
+                return frame
+            except ScreenRecordingPermissionError:
+                raise
+            except ScreenCaptureError as exc:
+                last_error = exc
+                logger.warning(
+                    "Capture attempt %d/%d failed: %s",
+                    attempt + 1,
+                    self._max_retries,
+                    exc,
+                )
+                if attempt < self._max_retries - 1:
+                    time.sleep(_RETRY_DELAY_SECONDS)
+
+        raise ScreenCaptureError(
+            f"Capture failed after {self._max_retries} attempts: {last_error}"
+        )
+
+    def _crop_to_region(self, frame: np.ndarray) -> np.ndarray:
+        """Crop a full-display frame to the configured region.
+
+        This is a fallback for when ScreenCaptureKit's sourceRect does
+        not crop as expected. Ensures the returned frame matches the
+        requested region dimensions.
+
+        Args:
+            frame: The full-display BGR frame.
+
+        Returns:
+            The cropped frame matching the configured region.
+
+        Raises:
+            ScreenCaptureError: If the region is out of bounds.
+        """
+        if self._region is None:
+            return frame
+
+        h, w = frame.shape[:2]
+        r = self._region
+        if r.x + r.width > w or r.y + r.height > h:
+            logger.warning(
+                "Region %s extends beyond frame bounds (%dx%d), "
+                "clamping to available area",
+                r,
+                w,
+                h,
+            )
+            x_end = min(r.x + r.width, w)
+            y_end = min(r.y + r.height, h)
+            return frame[r.y : y_end, r.x : x_end].copy()
+
+        return frame[r.y : r.y + r.height, r.x : r.x + r.width].copy()
 
     def _get_display(self, sc_shareable_content_cls: type) -> object:
         """Retrieve the target display via SCShareableContent.
@@ -228,7 +305,6 @@ class ScreenCapture:
         Raises:
             ScreenCaptureError: If the capture operation fails.
         """
-        from Quartz import CGMainDisplayID  # type: ignore[import-untyped]
         from ScreenCaptureKit import (  # type: ignore[import-untyped]
             SCContentFilter,
             SCScreenshotManager,
