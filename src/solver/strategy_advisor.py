@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from src.engine.game_state import HandState
+from src.engine.hand_history import HandState
 from src.solver.equity_calculator import EquityCalculator, EquityResult
 
 logger = logging.getLogger(__name__)

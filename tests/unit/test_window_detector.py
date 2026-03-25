@@ -276,6 +276,119 @@ class TestWindowDetectorDetect:
 
         assert len(result) == 1
 
+    def test_detects_poker_in_chrome(self) -> None:
+        """A poker site running in Chrome is detected via tab title."""
+        windows = [
+            _make_window_dict(
+                name="PokerStars - No Limit Hold'em - Table 1",
+                owner="Google Chrome",
+                window_id=20,
+            ),
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == 1
+        assert result[0].owner_name == "Google Chrome"
+
+    def test_detects_poker_in_safari(self) -> None:
+        """A poker site running in Safari is detected via tab title."""
+        windows = [
+            _make_window_dict(
+                name="Global Poker - Cash Game",
+                owner="Safari",
+                window_id=30,
+            ),
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == 1
+
+    def test_detects_poker_in_firefox(self) -> None:
+        """A poker site running in Firefox is detected via tab title."""
+        windows = [
+            _make_window_dict(
+                name="ClubGG - Tournament Lobby",
+                owner="Firefox",
+                window_id=40,
+            ),
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == 1
+
+    def test_detects_browser_poker_sites(self) -> None:
+        """Browser-only poker sites are detected by name."""
+        browser_poker_sites = [
+            ("Ignition Casino - No Limit Hold'em", "Google Chrome", 1),
+            ("Bovada - Tournament", "Safari", 2),
+            ("ACR Poker - Table 5", "Firefox", 3),
+            ("BetOnline - Cash Game", "Google Chrome", 4),
+            ("WSOP.com - Ring Game", "Safari", 5),
+            ("CoinPoker - Sit & Go", "Firefox", 6),
+        ]
+        windows = [
+            _make_window_dict(name=name, owner=owner, window_id=wid)
+            for name, owner, wid in browser_poker_sites
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == len(browser_poker_sites)
+
+    def test_generic_poker_keyword_in_browser(self) -> None:
+        """A browser tab with 'Poker' in the title is detected."""
+        windows = [
+            _make_window_dict(
+                name="SomeNew Poker Site - Lobby",
+                owner="Google Chrome",
+                window_id=50,
+            ),
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == 1
+
+    def test_ignores_non_poker_browser_tabs(self) -> None:
+        """Browser tabs without poker keywords are not detected."""
+        windows = [
+            _make_window_dict(
+                name="Gmail - Inbox",
+                owner="Google Chrome",
+                window_id=60,
+            ),
+            _make_window_dict(
+                name="YouTube - Home",
+                owner="Safari",
+                window_id=61,
+            ),
+        ]
+        mock_q = self._mock_quartz(windows)
+        detector = WindowDetector()
+
+        with patch.dict("sys.modules", {"Quartz": mock_q}):
+            result = detector.detect_windows(force_refresh=True)
+
+        assert len(result) == 0
+
 
 class TestFindWindowById:
     """Tests for find_window_by_id."""

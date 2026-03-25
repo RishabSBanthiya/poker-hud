@@ -1,34 +1,37 @@
+PYTHON ?= python3
+PIP ?= pip3
+
 .PHONY: test lint format format-check install dev clean check build package release
 
 test:
-	python -m pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 lint:
-	python -m ruff check src/ tests/ scripts/
+	$(PYTHON) -m ruff check src/ tests/ scripts/
 
 format:
-	python -m black src/ tests/ scripts/
+	$(PYTHON) -m black src/ tests/ scripts/
 
 format-check:
-	python -m black --check src/ tests/
+	$(PYTHON) -m black --check src/ tests/
 
 check: lint format-check test
 
 install:
-	pip install -e .
+	$(PIP) install -e .
 
 dev:
-	pip install -e ".[dev]"
+	$(PIP) install -e ".[dev]"
 
 clean:
 	rm -rf build/ dist/ *.egg-info .pytest_cache __pycache__
 	find . -type d -name __pycache__ -exec rm -rf {} +
 
 build:
-	python -m scripts.build
+	$(PYTHON) -m scripts.build
 
 package:
-	python -m scripts.package
+	$(PYTHON) -m scripts.package
 
 release: build package
 	@echo "------------------------------------------------------------"

@@ -1,6 +1,6 @@
 """Hand history parsing and serialization.
 
-Converts completed HandState objects to/from a storable format
+Converts completed hand state objects to/from a storable format
 for database persistence.
 """
 
@@ -8,18 +8,94 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from src.detection.card import Card, Rank, Suit
 from src.engine.game_state import (
     ActionType,
-    HandState,
+    GameState,
+    Player,
     PlayerAction,
-    PlayerState,
     Street,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight hand state types used by the integration wrappers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PlayerState:
+    """Simplified player state for hand history tracking.
+
+    Attributes:
+        name: Player screen name.
+        seat_index: Seat position (0-based).
+        is_hero: Whether this player is the user.
+        is_active: Whether the player is still in the hand.
+        hole_cards: Player's private cards, if known.
+        stack: Current stack size.
+    """
+
+    name: str
+    seat_index: int = 0
+    is_hero: bool = False
+    is_active: bool = True
+    hole_cards: list[Card] = field(default_factory=list)
+    stack: float = 0.0
+
+
+@dataclass
+class HandState:
+    """Simplified hand state for tracking a hand in progress.
+
+    Attributes:
+        hand_id: Unique identifier for this hand.
+        street: Current betting street.
+        community_cards: Board cards.
+        players: Players at the table.
+        actions: Chronological list of actions.
+        pot: Current pot size.
+        big_blind: Big blind amount.
+        is_complete: Whether the hand has finished.
+        winner_name: Name of the winner (if known).
+    """
+
+    hand_id: str = ""
+    street: Street = Street.PREFLOP
+    community_cards: list[Card] = field(default_factory=list)
+    players: list[PlayerState] = field(default_factory=list)
+    actions: list[PlayerAction] = field(default_factory=list)
+    pot: float = 0.0
+    big_blind: float = 1.0
+    is_complete: bool = False
+    winner_name: Optional[str] = None
+
+    def get_player(self, name: str) -> Optional[PlayerState]:
+        """Look up a player by name.
+
+        Args:
+            name: Player name to search for.
+
+        Returns:
+            The matching PlayerState, or None.
+        """
+        for p in self.players:
+            if p.name == name:
+                return p
+        return None
+
+    def get_active_players(self) -> list[PlayerState]:
+        """Return all players still in the hand.
+
+        Returns:
+            List of active PlayerState objects.
+        """
+        return [p for p in self.players if p.is_active]
 
 
 @dataclass
@@ -68,7 +144,7 @@ class HandHistoryParser:
                 "player": a.player_name,
                 "action": a.action_type.value,
                 "amount": a.amount,
-                "street": a.street.value,
+                "street": a.street.value if hasattr(a.street, 'value') else str(a.street),
             }
             for a in hand.actions
         ]
@@ -104,7 +180,7 @@ class HandHistoryParser:
                 player_name=a["player"],
                 action_type=ActionType(a["action"]),
                 amount=a["amount"],
-                street=Street(a["street"]),
+                street=Street[a["street"].upper()] if isinstance(a["street"], str) else a["street"],
             )
             for a in actions_data
         ]

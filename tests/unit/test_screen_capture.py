@@ -36,10 +36,11 @@ class TestCaptureRegion:
         with pytest.raises(ValueError, match="dimensions must be positive"):
             CaptureRegion(x=0, y=0, width=800, height=-1)
 
-    def test_negative_offset_raises(self) -> None:
-        """Region with negative offsets raises ValueError."""
-        with pytest.raises(ValueError, match="offsets must be non-negative"):
-            CaptureRegion(x=-10, y=0, width=800, height=600)
+    def test_negative_offset_valid_for_multimonitor(self) -> None:
+        """Region with negative offsets is valid (multi-monitor setups)."""
+        region = CaptureRegion(x=-1849, y=38, width=800, height=600)
+        assert region.x == -1849
+        assert region.y == 38
 
     def test_zero_offset_valid(self) -> None:
         """Region with zero offsets is valid."""

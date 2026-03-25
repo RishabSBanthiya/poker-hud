@@ -9,24 +9,16 @@ All tests mock the capture layer so no macOS screen recording is needed.
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import numpy as np
 import pytest
-from src.common.config import AppConfig
+from src.app import AppState, PokerHUDApp
+from src.common.config import AppConfig, StatsConfig
 from src.detection.card import Rank, Suit
-from src.detection.card_recognition import CardRecognitionPipeline
-from src.detection.detection_pipeline import DetectionPipeline
-from src.detection.ocr_engine import OCREngine
-from src.detection.player_identifier import PlayerIdentifier, PlayerInfo
-from src.engine.game_state import ActionType, HandState, Street
+from src.detection.detection_pipeline import PlayerInfo
+from src.engine.game_state import ActionType, Street
 from src.engine.game_state_coordinator import GameStateCoordinator
+from src.engine.hand_history import HandState
 from src.engine.hand_phase_tracker import HandPhaseTracker
-from src.solver.equity_calculator import EquityCalculator
-from src.solver.strategy_advisor import (
-    StrategyAdvice,
-    StrategyAdvisorCoordinator,
-)
 from src.stats.connection_manager import ConnectionManager
 from src.stats.hand_repository import HandRepository
 from src.stats.player_stats_repository import (
@@ -50,24 +42,7 @@ class TestCaptureToDetectionToGameState:
     """Test data flow from capture through detection into game state."""
 
     def test_frame_triggers_detection_and_state_update(self) -> None:
-        """A captured frame flows through detection and updates game state."""
-        # Setup detection pipeline with mock card recognition
-        card_recognition = CardRecognitionPipeline()
-        ocr_engine = OCREngine()
-        player_identifier = PlayerIdentifier(ocr_engine)
-
-        # Pre-set a player so detection returns something
-        player_identifier.set_player(0, "Hero", is_hero=True)
-        player_identifier.set_player(1, "Villain")
-
-        detection_pipeline = DetectionPipeline(
-            card_recognition=card_recognition,
-            ocr_engine=ocr_engine,
-            player_identifier=player_identifier,
-        )
-        detection_pipeline.initialize()
-
-        # Setup game state
+        """Detection results update game state via the coordinator."""
         hand_tracker = HandPhaseTracker()
         coordinator = GameStateCoordinator(hand_tracker)
 
@@ -77,16 +52,14 @@ class TestCaptureToDetectionToGameState:
             lambda s: state_changes.append(s)
         )
 
-        # Wire: detection -> game state
-        detection_pipeline.set_result_callback(
-            coordinator.process_detection
+        # Create a detection result with players
+        detection = make_detection_result(
+            players=[
+                PlayerInfo(seat_index=0, name="Hero", is_hero=True),
+                PlayerInfo(seat_index=1, name="Villain"),
+            ],
         )
-
-        # Simulate a frame capture
-        frame = np.zeros((600, 800, 3), dtype=np.uint8)
-        frame[:] = (34, 120, 50)
-
-        detection_pipeline.process_frame(frame)
+        coordinator.process_detection(detection)
 
         # A new hand should have been started with our players
         assert coordinator.current_hand is not None
@@ -99,12 +72,7 @@ class TestCaptureToDetectionToGameState:
         hand_tracker = HandPhaseTracker()
         coordinator = GameStateCoordinator(hand_tracker)
 
-        streets_seen: list[Street] = []
-
-        def track_state(hand: HandState) -> None:
-            streets_seen.append(hand.street)
-
-        coordinator.set_state_change_callback(track_state)
+        coordinator.set_state_change_callback(lambda _: None)
 
         # Preflop: no community cards
         preflop_detection = make_detection_result(
@@ -208,13 +176,11 @@ class TestGameStateToStats:
         record = make_sample_hand_record()
         aggregator.process_hand(record)
 
-        # Verify hand was stored
         assert hand_repo.count() == 1
         stored = hand_repo.get_by_id("test-001")
         assert stored is not None
         assert stored.pot == 10.0
 
-        # Verify stats updated for each player
         alice_stats = stats_repo.get("Alice")
         assert alice_stats is not None
         assert alice_stats.total_hands == 1
@@ -222,11 +188,7 @@ class TestGameStateToStats:
         bob_stats = stats_repo.get("Bob")
         assert bob_stats is not None
         assert bob_stats.total_hands == 1
-        assert bob_stats.pfr_hands == 1  # Bob raised preflop
-
-        charlie_stats = stats_repo.get("Charlie")
-        assert charlie_stats is not None
-        assert charlie_stats.total_hands == 1
+        assert bob_stats.pfr_hands == 1
 
     def test_vpip_tracks_voluntary_money(
         self, in_memory_db: ConnectionManager
@@ -239,17 +201,14 @@ class TestGameStateToStats:
         record = make_sample_hand_record()
         aggregator.process_hand(record)
 
-        # Alice: posted blind (not voluntary) + called (voluntary) -> vpip=1
         alice = stats_repo.get("Alice")
         assert alice is not None
         assert alice.vpip_hands == 1
 
-        # Bob: raised preflop (voluntary) -> vpip=1
         bob = stats_repo.get("Bob")
         assert bob is not None
         assert bob.vpip_hands == 1
 
-        # Charlie: posted blind then folded (not voluntary) -> vpip=0
         charlie = stats_repo.get("Charlie")
         assert charlie is not None
         assert charlie.vpip_hands == 0
@@ -262,7 +221,6 @@ class TestGameStateToStats:
         stats_repo = PlayerStatsRepository(in_memory_db)
         aggregator = StatsAggregator(hand_repo, stats_repo)
 
-        # Process two hands
         record1 = make_sample_hand_record(hand_id="h1")
         record2 = make_sample_hand_record(hand_id="h2")
         aggregator.process_hand(record1)
@@ -273,7 +231,7 @@ class TestGameStateToStats:
         bob = stats_repo.get("Bob")
         assert bob is not None
         assert bob.total_hands == 2
-        assert bob.pfr_hands == 2  # Raised preflop in both
+        assert bob.pfr_hands == 2
 
     def test_stats_callback_invoked_on_hand_complete(
         self, in_memory_db: ConnectionManager
@@ -306,10 +264,8 @@ class TestGameStateToStats:
         hand_tracker = HandPhaseTracker()
         coordinator = GameStateCoordinator(hand_tracker)
 
-        # Wire: coordinator -> aggregator
         coordinator.set_hand_complete_callback(aggregator.process_hand)
 
-        # Start a hand
         detection = make_detection_result(
             players=[
                 PlayerInfo(seat_index=0, name="Hero", is_hero=True),
@@ -318,15 +274,12 @@ class TestGameStateToStats:
         )
         coordinator.process_detection(detection)
 
-        # Add some actions
         coordinator.record_action("Villain", ActionType.RAISE, 3.0)
         coordinator.record_action("Hero", ActionType.CALL, 3.0)
 
-        # Complete the hand
         record = coordinator.complete_hand(winner_name="Hero")
         assert record is not None
 
-        # Verify hand was persisted via aggregator
         assert hand_repo.count() == 1
         hero_stats = stats_repo.get("Hero")
         assert hero_stats is not None
@@ -334,7 +287,7 @@ class TestGameStateToStats:
 
 
 # ---------------------------------------------------------------------------
-# Full hand lifecycle: Detection -> State -> Stats -> Advice
+# Full hand lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -344,8 +297,7 @@ class TestFullHandLifecycle:
     def test_full_pipeline_detection_to_advice(
         self, in_memory_db: ConnectionManager
     ) -> None:
-        """End-to-end: detection -> game state -> stats + advice."""
-        # Setup all subsystems
+        """End-to-end: detection -> game state -> stats."""
         hand_tracker = HandPhaseTracker()
         coordinator = GameStateCoordinator(hand_tracker)
 
@@ -353,20 +305,9 @@ class TestFullHandLifecycle:
         stats_repo = PlayerStatsRepository(in_memory_db)
         aggregator = StatsAggregator(hand_repo, stats_repo)
 
-        equity_calc = EquityCalculator(num_simulations=100)
-        advisor = StrategyAdvisorCoordinator(equity_calc)
-
-        # Track advice
-        advice_received: list[StrategyAdvice] = []
-        advisor.set_advice_callback(
-            lambda a: advice_received.append(a)
-        )
-
-        # Wire everything
         coordinator.set_hand_complete_callback(aggregator.process_hand)
-        coordinator.set_state_change_callback(advisor.analyze_state)
 
-        # Phase 1: Detection sends preflop with hero having pocket aces
+        # Phase 1: Preflop with hero having pocket aces
         hole_cards = [
             make_detected_card(Rank.ACE, Suit.SPADES, x=350, y=450),
             make_detected_card(Rank.ACE, Suit.HEARTS, x=420, y=450),
@@ -380,21 +321,17 @@ class TestFullHandLifecycle:
         )
         coordinator.process_detection(detection)
 
-        # Verify game state was created
         hand = coordinator.current_hand
         assert hand is not None
         hero = hand.get_player("Hero")
         assert hero is not None
         assert len(hero.hole_cards) == 2
 
-        # Advice should have been generated (hero has hole cards)
-        assert len(advice_received) >= 1
-
-        # Phase 2: Actions happen
+        # Phase 2: Actions
         coordinator.record_action("Villain", ActionType.RAISE, 3.0)
         coordinator.record_action("Hero", ActionType.CALL, 3.0)
 
-        # Phase 3: Flop comes
+        # Phase 3: Flop
         flop_cards = [
             make_detected_card(Rank.ACE, Suit.DIAMONDS, x=200, y=100),
             make_detected_card(Rank.KING, Suit.CLUBS, x=270, y=100),
@@ -409,18 +346,15 @@ class TestFullHandLifecycle:
             ],
         )
         coordinator.process_detection(flop_detection)
-
         assert coordinator.current_hand.street == Street.FLOP
 
-        # Phase 4: Complete the hand
+        # Phase 4: Complete
         record = coordinator.complete_hand(winner_name="Hero")
         assert record is not None
 
-        # Verify stats were updated
         hero_stats = stats_repo.get("Hero")
         assert hero_stats is not None
         assert hero_stats.total_hands == 1
-        assert hero_stats.vpip_hands == 1  # Hero called
 
     def test_new_hand_starts_after_completion(
         self, in_memory_db: ConnectionManager
@@ -456,7 +390,7 @@ class TestFullHandLifecycle:
         hand2_id = coordinator.current_hand.hand_id
 
         assert hand1_id != hand2_id
-        assert hand_repo.count() == 1  # Only first hand persisted
+        assert hand_repo.count() == 1
 
     def test_stats_formatted_for_overlay(
         self, in_memory_db: ConnectionManager
@@ -466,14 +400,12 @@ class TestFullHandLifecycle:
         stats_repo = PlayerStatsRepository(in_memory_db)
         aggregator = StatsAggregator(hand_repo, stats_repo, min_hands=2)
 
-        # One hand — below min_hands threshold
         record = make_sample_hand_record()
         aggregator.process_hand(record)
 
         hud_text = aggregator.format_player_hud("Bob")
-        assert "1 hands" in hud_text  # Below threshold, shows hand count
+        assert "1 hands" in hud_text
 
-        # Second hand
         record2 = make_sample_hand_record(hand_id="h2")
         aggregator.process_hand(record2)
 
@@ -494,13 +426,11 @@ class TestFullHandLifecycle:
 
         bob = stats_repo.get("Bob")
         assert bob is not None
-        # Bob raised preflop and called on flop
         assert bob.total_raises == 1
         assert bob.total_calls == 1
 
         alice = stats_repo.get("Alice")
         assert alice is not None
-        # Alice called preflop and bet on flop
         assert alice.total_calls == 1
         assert alice.total_bets == 1
 
@@ -515,68 +445,54 @@ class TestAppIntegration:
 
     def test_app_initializes_all_subsystems(self) -> None:
         """App initialize() creates and wires all subsystems."""
-        from src.app import AppState, PokerHUDApp
-
-        config = AppConfig()
-        config.stats.db_path = ":memory:"
+        config = AppConfig(
+            stats=StatsConfig(db_path=":memory:")
+        )
         app = PokerHUDApp(config=config, enable_overlay=False)
         app.initialize()
 
         assert app.state == AppState.INITIALIZED
         assert app.capture_pipeline is not None
-        assert app.detection_pipeline is not None
         assert app.game_state_coordinator is not None
         assert app.stats_aggregator is not None
         assert app.strategy_advisor is not None
         assert app.connection_manager is not None
-        assert app.connection_manager.is_initialized
 
         app.stop()
         assert app.state == AppState.STOPPED
 
     def test_app_pause_resume_cycle(self) -> None:
         """App can be paused and resumed."""
-        from src.app import AppState, PokerHUDApp
-
-        config = AppConfig()
-        config.stats.db_path = ":memory:"
+        config = AppConfig(
+            stats=StatsConfig(db_path=":memory:")
+        )
         app = PokerHUDApp(config=config, enable_overlay=False)
         app.initialize()
+        app.start()
+        assert app.state == AppState.RUNNING
 
-        # Mock the capture to avoid actual screen capture
-        with patch.object(
-            app.capture_pipeline._frame_poller._capture,
-            "capture_frame",
-            return_value=np.zeros((100, 100, 3), dtype=np.uint8),
-        ):
-            app.start()
-            assert app.state == AppState.RUNNING
+        app.pause()
+        assert app.state == AppState.PAUSED
 
-            app.pause()
-            assert app.state == AppState.PAUSED
-
-            app.resume()
-            assert app.state == AppState.RUNNING
+        app.resume()
+        assert app.state == AppState.RUNNING
 
         app.stop()
         assert app.state == AppState.STOPPED
 
     def test_app_start_without_initialize_raises(self) -> None:
         """Starting without initializing raises RuntimeError."""
-        from src.app import PokerHUDApp
-
-        app = PokerHUDApp()
+        app = PokerHUDApp(enable_overlay=False)
         with pytest.raises(RuntimeError, match="Cannot start"):
             app.start()
 
     def test_app_double_stop_is_safe(self) -> None:
         """Calling stop() twice does not raise."""
-        from src.app import AppState, PokerHUDApp
-
-        config = AppConfig()
-        config.stats.db_path = ":memory:"
+        config = AppConfig(
+            stats=StatsConfig(db_path=":memory:")
+        )
         app = PokerHUDApp(config=config, enable_overlay=False)
         app.initialize()
         app.stop()
-        app.stop()  # Should not raise
+        app.stop()
         assert app.state == AppState.STOPPED

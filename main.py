@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 
 from src.app import PokerHUDApp
-from src.common.config import AppConfig
+from src.common.config import AppConfig, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config",
         type=str,
         default=None,
-        help="Path to JSON configuration file",
+        help="Path to YAML/TOML configuration file",
     )
     parser.add_argument(
         "--debug",
@@ -53,6 +54,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Run the Poker HUD application.
 
+    When the overlay is enabled, runs the AppKit event loop on the main
+    thread (required by macOS for window rendering). In headless mode,
+    blocks on a threading event instead.
+
     Args:
         argv: Command-line arguments (defaults to sys.argv[1:]).
 
@@ -64,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     # Load configuration
     if args.config:
         try:
-            config = AppConfig.from_file(args.config)
+            config = load_config(args.config)
         except FileNotFoundError:
             print(
                 f"Error: Configuration file not found: {args.config}",
@@ -80,21 +85,47 @@ def main(argv: list[str] | None = None) -> int:
     else:
         config = AppConfig()
 
-    if args.debug:
-        config.debug = True
-
     enable_overlay = not args.no_overlay
+    debug = args.debug
 
     # Create and run the application
-    app = PokerHUDApp(config=config, enable_overlay=enable_overlay)
+    app = PokerHUDApp(config=config, enable_overlay=enable_overlay, debug=debug)
 
     try:
-        app.initialize()
-        app.install_signal_handlers()
-        app.start()
+        if enable_overlay:
+            # AppKit requires NSApplication on the main thread.
+            from AppKit import NSApplication
+            from PyObjCTools import AppHelper
 
-        print("Poker HUD is running. Press Ctrl+C to stop.")
-        app.wait_for_shutdown()
+            ns_app = NSApplication.sharedApplication()
+            # Regular policy so overlay windows render on screen.
+            # Accessory (2) prevents window display.
+            ns_app.setActivationPolicy_(0)
+            ns_app.activateIgnoringOtherApps_(True)
+
+            app.initialize()
+            app.start()
+
+            # Install signal handlers that stop AppKit run loop
+            def _signal_handler(signum: int, _frame: object) -> None:
+                sig_name = signal.Signals(signum).name
+                logger.info("Received %s, shutting down...", sig_name)
+                app.stop()
+                AppHelper.stopEventLoop()
+
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+
+            print("Poker HUD is running. Press Ctrl+C to stop.")
+            AppHelper.runEventLoop()
+        else:
+            # Headless mode — no overlay, no AppKit
+            app.initialize()
+            app.install_signal_handlers()
+            app.start()
+
+            print("Poker HUD is running (headless). Press Ctrl+C to stop.")
+            app.wait_for_shutdown()
 
     except KeyboardInterrupt:
         pass

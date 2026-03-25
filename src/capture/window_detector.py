@@ -2,7 +2,8 @@
 
 Enumerates visible windows via CGWindowListCopyWindowInfo and matches
 known poker client title patterns. Supports detecting multiple tables
-and auto-refreshing the window list.
+and auto-refreshing the window list. Works with both native poker
+clients and browser-based poker sites (Chrome, Safari, Firefox, etc.).
 """
 
 from __future__ import annotations
@@ -16,18 +17,44 @@ from typing import Optional, Sequence
 logger = logging.getLogger(__name__)
 
 # Default poker client window title patterns (case-insensitive).
+# These match against both window titles and owner names, so they work for
+# native poker clients AND browser-based poker sites (where the owner is
+# e.g. "Google Chrome" but the tab title contains the poker site name).
 DEFAULT_TITLE_PATTERNS: tuple[str, ...] = (
+    # Native poker clients
     r"PokerStars",
     r"888poker",
     r"PartyPoker",
     r"GGPoker",
     r"WPT\s+Global",
+    # Browser-based poker sites
+    r"ClubGG",
+    r"Natural8",
+    r"Ignition\s+(Casino|Poker)",
+    r"Bovada",
+    r"ACR\s+Poker",
+    r"Americas\s+Cardroom",
+    r"BetOnline",
+    r"Global\s+Poker",
+    r"WSOP\.com",
+    r"PokerKing",
+    r"Replay\s+Poker",
+    r"CoinPoker",
+    r"PPPoker",
+    r"Winamax",
+    # Generic poker keyword — catches most poker sites in browser tabs.
+    # Negative lookbehind/lookahead avoids matching file paths (poker-hud)
+    # and project names (poker_stats).
+    r"(?<!/)\bPoker\b(?![-_])",
+    # Game type indicators (work across native and browser)
     r"Table\b",
     r"Hold'?em",
     r"No\s+Limit",
     r"Pot\s+Limit",
     r"Omaha",
     r"Tournament",
+    r"Cash\s+Game",
+    r"Sit\s*&?\s*Go",
 )
 
 

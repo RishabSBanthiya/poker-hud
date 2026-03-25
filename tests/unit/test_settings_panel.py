@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from src.common.config import AppConfig, StatsConfig
+from src.common.config import AppConfig, OverlayConfig, StatsConfig
 from src.overlay.settings_panel import (
     SUPPORTED_CLIENTS,
     SettingsPanel,
@@ -24,13 +24,16 @@ class TestSettingsPanelInit:
         panel = SettingsPanel()
         assert panel.visible is False
         assert panel.is_dirty is False
-        assert panel.get_config().poker_client == "PokerStars"
+        assert panel.get_poker_client() == "PokerStars"
 
     def test_custom_config_init(self) -> None:
-        config = AppConfig(poker_client="888poker", table_size=6)
+        config = AppConfig(
+            overlay=OverlayConfig(opacity=0.5),
+            stats=StatsConfig(db_path="/tmp/test.db"),
+        )
         panel = SettingsPanel(config=config)
-        assert panel.get_config().poker_client == "888poker"
-        assert panel.get_config().table_size == 6
+        assert panel.get_config().overlay.opacity == 0.5
+        assert panel.get_config().stats.db_path == "/tmp/test.db"
 
     def test_custom_config_path(self) -> None:
         panel = SettingsPanel(config_path="/tmp/custom.json")
@@ -63,7 +66,7 @@ class TestOverlaySettings:
 
     def test_set_font_size(self) -> None:
         self.panel.set_font_size(16.0)
-        assert self.panel.get_config().overlay.font_size == 16.0
+        assert self.panel.get_config().overlay.font_size == 16
         assert self.panel.is_dirty is True
 
     def test_set_font_size_invalid(self) -> None:
@@ -72,14 +75,14 @@ class TestOverlaySettings:
 
     def test_set_compact_mode(self) -> None:
         self.panel.set_compact_mode(False)
-        assert self.panel.get_config().overlay.compact_mode is False
+        assert self.panel._state.settings.compact_mode is False
         assert self.panel.is_dirty is True
 
     def test_set_overlay_visible(self) -> None:
         self.panel.set_overlay_visible(False)
-        cfg = self.panel.get_config()
-        assert cfg.overlay.show_stats_panel is False
-        assert cfg.overlay.show_solver_panel is False
+        s = self.panel._state.settings
+        assert s.show_stats_panel is False
+        assert s.show_solver_panel is False
         assert self.panel.is_dirty is True
 
     def test_visibility_toggle(self) -> None:
@@ -154,7 +157,7 @@ class TestTableSettings:
 
     def test_set_table_size(self) -> None:
         self.panel.set_table_size(6)
-        assert self.panel.get_config().table_size == 6
+        assert self.panel._state.settings.table_size == 6
         assert self.panel.is_dirty is True
 
     def test_set_table_size_too_small(self) -> None:
@@ -166,9 +169,11 @@ class TestTableSettings:
             self.panel.set_table_size(11)
 
     def test_set_stats_config(self) -> None:
-        cfg = StatsConfig(vpip_loose_threshold=40.0)
+        cfg = StatsConfig(vpip_loose_threshold=45.0)
         self.panel.set_stats_config(cfg)
-        assert self.panel.get_config().stats.vpip_loose_threshold == 40.0
+        assert (
+            self.panel.get_config().stats.vpip_loose_threshold == 45.0
+        )
         assert self.panel.is_dirty is True
 
 
@@ -182,11 +187,13 @@ class TestApplyAndReset:
 
     def test_apply_config(self) -> None:
         panel = SettingsPanel()
-        new_config = AppConfig(poker_client="GGPoker", table_size=6)
+        new_config = AppConfig(
+            overlay=OverlayConfig(opacity=0.7, font_size=18),
+        )
         panel.apply_config(new_config)
 
-        assert panel.get_config().poker_client == "GGPoker"
-        assert panel.get_config().table_size == 6
+        assert panel.get_config().overlay.opacity == 0.7
+        assert panel.get_config().overlay.font_size == 18
         assert panel.is_dirty is True
 
     def test_reset_to_defaults(self) -> None:
@@ -195,8 +202,8 @@ class TestApplyAndReset:
         panel.set_table_size(6)
         panel.reset_to_defaults()
 
-        assert panel.get_config().poker_client == "PokerStars"
-        assert panel.get_config().table_size == 9
+        assert panel.get_poker_client() == "PokerStars"
+        assert panel._state.settings.table_size == 9
         assert panel.is_dirty is True  # reset is a change
 
 
@@ -225,9 +232,9 @@ class TestPersistence:
         panel2 = SettingsPanel(config_path=str(config_file))
         loaded = panel2.load_config()
 
-        assert loaded.poker_client == "888poker"
+        assert panel2.get_poker_client() == "888poker"
         assert loaded.overlay.opacity == 0.6
-        assert loaded.table_size == 6
+        assert panel2._state.settings.table_size == 6
         assert panel2.is_dirty is False
 
     def test_save_with_override_path(self, tmp_path: Path) -> None:

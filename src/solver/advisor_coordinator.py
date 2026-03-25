@@ -46,6 +46,21 @@ class ActionRecommendation(Enum):
     ALL_IN = auto()
 
 
+@dataclass(frozen=True)
+class DrawInfo:
+    """Information about a potential draw.
+
+    Attributes:
+        draw_description: Human-readable draw type (e.g., "flush draw").
+        outs: Number of outs to complete the draw.
+        probability: Probability of hitting the draw by river (0.0-1.0).
+    """
+
+    draw_description: str = ""
+    outs: int = 0
+    probability: float = 0.0
+
+
 @dataclass
 class StrategyAdvice:
     """Complete strategy recommendation from the solver.
@@ -207,6 +222,7 @@ class StrategyAdvisorCoordinator:
         self._cache: OrderedDict[str, StrategyAdvice] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._callbacks: list[Callable[[StrategyAdvice], None]] = []
+        self._latest_advice: StrategyAdvice | None = None
 
         # Performance tracking
         self._latency_tracker = LatencyTracker("advisor_full_pipeline")
@@ -216,6 +232,11 @@ class StrategyAdvisorCoordinator:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    @property
+    def latest_advice(self) -> StrategyAdvice | None:
+        """The most recently computed strategy advice, or None."""
+        return self._latest_advice
 
     def on_advice_ready(self, callback: Callable[[StrategyAdvice], None]) -> None:
         """Register a callback invoked when async advice is ready.
@@ -256,6 +277,7 @@ class StrategyAdvisorCoordinator:
             while len(self._cache) > _MAX_CACHE_SIZE:
                 self._cache.popitem(last=False)
 
+        self._latest_advice = advice
         return advice
 
     def get_advice_async(

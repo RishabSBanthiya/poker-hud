@@ -65,6 +65,12 @@ class StatsConfig:
     max_connections: int = 5
     wal_mode: bool = True
 
+    # HUD display thresholds for color coding
+    vpip_loose_threshold: float = 40.0
+    vpip_tight_threshold: float = 12.0
+    pfr_loose_threshold: float = 30.0
+    pfr_tight_threshold: float = 8.0
+
 
 @dataclass(frozen=True)
 class SolverConfig:

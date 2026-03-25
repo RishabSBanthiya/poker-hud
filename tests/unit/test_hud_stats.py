@@ -93,12 +93,11 @@ class TestStatsFormatter:
     def setup_method(self) -> None:
         self.formatter = StatsFormatter()
         self.stats = PlayerStats(
-            player_name="TestPlayer",
-            hands_played=100,
             vpip=22.3,
             pfr=17.8,
             three_bet_pct=8.2,
             aggression_factor=2.15,
+            total_hands=100,
         )
 
     def test_compact_format(self) -> None:
@@ -144,7 +143,7 @@ class TestStatsFormatterColors:
         assert self.formatter.get_vpip_color(stats) == StatColor.YELLOW
 
     def test_very_loose_vpip_is_red(self) -> None:
-        stats = PlayerStats(vpip=35.0)
+        stats = PlayerStats(vpip=45.0)
         assert self.formatter.get_vpip_color(stats) == StatColor.RED
 
     def test_very_tight_vpip_is_red(self) -> None:
@@ -156,11 +155,11 @@ class TestStatsFormatterColors:
         assert self.formatter.get_pfr_color(stats) == StatColor.GREEN
 
     def test_loose_pfr_is_red(self) -> None:
-        stats = PlayerStats(pfr=28.0)
+        stats = PlayerStats(pfr=35.0)
         assert self.formatter.get_pfr_color(stats) == StatColor.RED
 
     def test_tight_pfr_is_red(self) -> None:
-        stats = PlayerStats(pfr=8.0)
+        stats = PlayerStats(pfr=5.0)
         assert self.formatter.get_pfr_color(stats) == StatColor.RED
 
     def test_overall_color_follows_vpip(self) -> None:

@@ -8,8 +8,11 @@ from src.overlay.solver_panel import (
     format_action,
     get_action_color,
 )
-from src.solver.advisor_coordinator import DrawInfo, StrategyAdvice
-from src.solver.postflop_advisor import Action, ActionRecommendation
+from src.solver.advisor_coordinator import (
+    ActionRecommendation,
+    DrawInfo,
+    StrategyAdvice,
+)
 
 # ---------------------------------------------------------------------------
 # Helper factory
@@ -17,27 +20,17 @@ from src.solver.postflop_advisor import Action, ActionRecommendation
 
 
 def _make_advice(
-    action: Action = Action.CALL,
-    confidence: float = 0.8,
-    ev: float = 1.5,
-    equity: float = 55.0,
-    pot_odds: float = 33.0,
-    opponent_range: str = "Top 20%",
-    draw_info: DrawInfo | None = None,
-    reasoning: str = "",
+    recommendation: ActionRecommendation = ActionRecommendation.CALL,
+    equity: float = 0.55,
+    recommended_sizing: float | None = None,
+    reasoning: list[str] | None = None,
 ) -> StrategyAdvice:
     """Create a StrategyAdvice for testing."""
     return StrategyAdvice(
-        recommendation=ActionRecommendation(
-            action=action,
-            confidence=confidence,
-            ev=ev,
-            reasoning=reasoning,
-        ),
+        recommendation=recommendation,
         equity=equity,
-        pot_odds=pot_odds,
-        opponent_range_summary=opponent_range,
-        draw_info=draw_info,
+        recommended_sizing=recommended_sizing,
+        reasoning=reasoning or [],
     )
 
 
@@ -50,28 +43,28 @@ class TestActionHelpers:
     """Tests for action color and format helpers."""
 
     def test_raise_is_green(self) -> None:
-        assert get_action_color(Action.RAISE) == ActionColor.GREEN
+        assert get_action_color(ActionRecommendation.RAISE) == ActionColor.GREEN
 
     def test_all_in_is_green(self) -> None:
-        assert get_action_color(Action.ALL_IN) == ActionColor.GREEN
+        assert get_action_color(ActionRecommendation.ALL_IN) == ActionColor.GREEN
 
     def test_call_is_yellow(self) -> None:
-        assert get_action_color(Action.CALL) == ActionColor.YELLOW
+        assert get_action_color(ActionRecommendation.CALL) == ActionColor.YELLOW
 
     def test_check_is_yellow(self) -> None:
-        assert get_action_color(Action.CHECK) == ActionColor.YELLOW
+        assert get_action_color(ActionRecommendation.CHECK) == ActionColor.YELLOW
 
     def test_fold_is_red(self) -> None:
-        assert get_action_color(Action.FOLD) == ActionColor.RED
+        assert get_action_color(ActionRecommendation.FOLD) == ActionColor.RED
 
     def test_format_action_raise(self) -> None:
-        assert format_action(Action.RAISE) == "RAISE"
+        assert format_action(ActionRecommendation.RAISE) == "RAISE"
 
     def test_format_action_fold(self) -> None:
-        assert format_action(Action.FOLD) == "FOLD"
+        assert format_action(ActionRecommendation.FOLD) == "FOLD"
 
     def test_format_action_all_in(self) -> None:
-        assert format_action(Action.ALL_IN) == "ALL_IN"
+        assert format_action(ActionRecommendation.ALL_IN) == "ALL_IN"
 
 
 # ---------------------------------------------------------------------------
@@ -92,68 +85,74 @@ class TestSolverPanel:
         assert self.panel.get_action_color() == ActionColor.WHITE
 
     def test_update_advice_call(self) -> None:
-        advice = _make_advice(action=Action.CALL, equity=55.0, pot_odds=33.0)
+        advice = _make_advice(
+            recommendation=ActionRecommendation.CALL, equity=0.55
+        )
         self.panel.update_advice(advice)
 
         assert self.panel.state.action_text == "CALL"
         assert self.panel.state.equity_text == "Eq:55%"
-        assert self.panel.state.pot_odds_text == "PO:33%"
         assert self.panel.get_action_color() == ActionColor.YELLOW
 
     def test_update_advice_raise(self) -> None:
-        advice = _make_advice(action=Action.RAISE, equity=72.0, pot_odds=25.0)
+        advice = _make_advice(
+            recommendation=ActionRecommendation.RAISE,
+            equity=0.72,
+            recommended_sizing=0.75,
+        )
         self.panel.update_advice(advice)
 
         assert self.panel.state.action_text == "RAISE"
         assert self.panel.get_action_color() == ActionColor.GREEN
 
     def test_update_advice_fold(self) -> None:
-        advice = _make_advice(action=Action.FOLD, equity=15.0, pot_odds=40.0)
+        advice = _make_advice(
+            recommendation=ActionRecommendation.FOLD, equity=0.15
+        )
         self.panel.update_advice(advice)
 
         assert self.panel.state.action_text == "FOLD"
         assert self.panel.get_action_color() == ActionColor.RED
 
     def test_compact_text(self) -> None:
-        advice = _make_advice(action=Action.RAISE, equity=65.0, pot_odds=33.0)
+        advice = _make_advice(
+            recommendation=ActionRecommendation.RAISE,
+            equity=0.65,
+            recommended_sizing=0.75,
+        )
         self.panel.update_advice(advice)
 
         text = self.panel.get_compact_text()
         assert "RAISE" in text
         assert "Eq:65%" in text
-        assert "PO:33%" in text
+        assert "Size:75%" in text
+
+    def test_compact_text_no_sizing(self) -> None:
+        advice = _make_advice(
+            recommendation=ActionRecommendation.FOLD, equity=0.20
+        )
+        self.panel.update_advice(advice)
+
+        text = self.panel.get_compact_text()
+        assert "FOLD" in text
+        assert "Size" not in text
 
     def test_expanded_text(self) -> None:
         advice = _make_advice(
-            action=Action.CALL,
-            equity=55.0,
-            pot_odds=33.0,
-            opponent_range="Top 20%",
+            recommendation=ActionRecommendation.CALL,
+            equity=0.55,
+            reasoning=["Good pot odds"],
         )
         self.panel.update_advice(advice)
 
         text = self.panel.get_expanded_text()
         assert "Action: CALL" in text
         assert "Equity: Eq:55%" in text
-        assert "Range: Top 20%" in text
-
-    def test_expanded_text_with_draws(self) -> None:
-        draw = DrawInfo(
-            has_flush_draw=True,
-            has_straight_draw=False,
-            outs=9,
-            draw_description="Nut flush draw",
-        )
-        advice = _make_advice(draw_info=draw)
-        self.panel.update_advice(advice)
-
-        text = self.panel.get_expanded_text()
-        assert "Draws:" in text
-        assert "Nut flush draw" in text
-        assert "9 outs" in text
 
     def test_expanded_text_with_reasoning(self) -> None:
-        advice = _make_advice(reasoning="Strong value bet opportunity")
+        advice = _make_advice(
+            reasoning=["Strong value bet opportunity"],
+        )
         self.panel.update_advice(advice)
 
         text = self.panel.get_expanded_text()
@@ -195,37 +194,39 @@ class TestSolverPanel:
 
     def test_draw_format_with_description(self) -> None:
         draw = DrawInfo(
-            has_flush_draw=True,
             outs=9,
             draw_description="Nut flush draw",
         )
-        advice = _make_advice(draw_info=draw)
-        self.panel.update_advice(advice)
-        assert "Nut flush draw (9 outs)" in self.panel.state.draw_text
+        result = SolverPanel._format_draw_info(draw)
+        assert "Nut flush draw (9 outs)" in result
 
-    def test_draw_format_without_description(self) -> None:
-        draw = DrawInfo(
-            has_flush_draw=True,
-            has_straight_draw=True,
-            outs=15,
-        )
-        advice = _make_advice(draw_info=draw)
-        self.panel.update_advice(advice)
-        assert "Flush draw" in self.panel.state.draw_text
-        assert "Straight draw" in self.panel.state.draw_text
-        assert "15 outs" in self.panel.state.draw_text
+    def test_draw_format_with_outs_only(self) -> None:
+        draw = DrawInfo(outs=9, probability=0.35)
+        result = SolverPanel._format_draw_info(draw)
+        assert "9 outs" in result
+        assert "35%" in result
 
     def test_draw_format_no_draws(self) -> None:
-        draw = DrawInfo(has_flush_draw=False, has_straight_draw=False, outs=0)
-        advice = _make_advice(draw_info=draw)
-        self.panel.update_advice(advice)
-        assert self.panel.state.draw_text == ""
-
-    def test_no_draw_info(self) -> None:
-        advice = _make_advice(draw_info=None)
-        self.panel.update_advice(advice)
-        assert self.panel.state.draw_text == ""
+        draw = DrawInfo(outs=0)
+        result = SolverPanel._format_draw_info(draw)
+        assert result == ""
 
     def test_expanded_mode_from_constructor(self) -> None:
         panel = SolverPanel(expanded=True)
         assert panel.expanded is True
+
+    def test_sizing_text_present_when_sizing_given(self) -> None:
+        advice = _make_advice(
+            recommendation=ActionRecommendation.RAISE,
+            equity=0.70,
+            recommended_sizing=0.50,
+        )
+        self.panel.update_advice(advice)
+        assert self.panel.state.sizing_text == "Size:50%"
+
+    def test_sizing_text_empty_when_no_sizing(self) -> None:
+        advice = _make_advice(
+            recommendation=ActionRecommendation.CHECK, equity=0.40
+        )
+        self.panel.update_advice(advice)
+        assert self.panel.state.sizing_text == ""

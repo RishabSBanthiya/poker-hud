@@ -15,10 +15,39 @@ from typing import Optional
 
 import numpy as np
 
+from Foundation import NSDate, NSRunLoop  # type: ignore[import-untyped]
+
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _RETRY_DELAY_SECONDS = 0.1
+
+
+def _wait_with_runloop(event: threading.Event, timeout: float) -> bool:
+    """Wait for a threading.Event while spinning the NSRunLoop.
+
+    ScreenCaptureKit completion handlers are dispatched via GCD.  When the
+    calling thread has no active run loop (e.g. a plain ``threading.Thread``),
+    the callbacks may never be delivered — causing a hang or, on Apple Silicon,
+    a SIGTRAP (trace trap).  Spinning the NSRunLoop in short increments lets
+    the GCD callbacks land on this thread.
+
+    Args:
+        event: The event to wait for.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        True if the event was set before the timeout, False otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        NSRunLoop.currentRunLoop().runUntilDate_(
+            NSDate.dateWithTimeIntervalSinceNow_(min(0.05, remaining))
+        )
+    return True
 
 
 @dataclass
@@ -26,8 +55,10 @@ class CaptureRegion:
     """Defines a rectangular capture region on screen.
 
     Attributes:
-        x: Horizontal offset in pixels from the left edge.
-        y: Vertical offset in pixels from the top edge.
+        x: Horizontal position in global screen coordinates. May be negative
+           on multi-monitor setups where a display sits left of the primary.
+        y: Vertical position in global screen coordinates. May be negative
+           on multi-monitor setups where a display sits above the primary.
         width: Width of the capture region in pixels.
         height: Height of the capture region in pixels.
     """
@@ -42,11 +73,6 @@ class CaptureRegion:
             raise ValueError(
                 f"Capture region dimensions must be positive, "
                 f"got width={self.width}, height={self.height}"
-            )
-        if self.x < 0 or self.y < 0:
-            raise ValueError(
-                f"Capture region offsets must be non-negative, "
-                f"got x={self.x}, y={self.y}"
             )
 
 
@@ -222,7 +248,7 @@ class ScreenCapture:
 
         sc_shareable_content_cls.getShareableContentWithCompletionHandler_(handler)
 
-        if not content_ready.wait(timeout=10.0):
+        if not _wait_with_runloop(content_ready, timeout=10.0):
             raise ScreenCaptureError(
                 "Timed out waiting for SCShareableContent response"
             )
@@ -263,6 +289,11 @@ class ScreenCapture:
     ) -> object:
         """Build an SCStreamConfiguration for the capture.
 
+        When a region is specified, sourceRect coordinates must be relative
+        to the display origin (not global screen coordinates). The output
+        width/height must also account for the display's pixel scale factor
+        (Retina displays report 2x).
+
         Args:
             sc_stream_config_cls: The SCStreamConfiguration class.
             display: The target SCDisplay object.
@@ -272,20 +303,48 @@ class ScreenCapture:
         """
         config = sc_stream_config_cls.alloc().init()
 
+        # Determine the display's scale factor (Retina = 2, standard = 1).
+        display_width_pt = display.width()
+        display_height_pt = display.height()
+
         if self._region is not None:
-            config.setWidth_(self._region.width)
-            config.setHeight_(self._region.height)
-            config.setSourceRect_(
-                _make_cg_rect(
-                    self._region.x,
-                    self._region.y,
-                    self._region.width,
-                    self._region.height,
+            # Convert global screen coordinates to display-relative.
+            # Display frame origin comes from the display object.
+            try:
+                display_frame = display.frame()
+                display_x = int(display_frame.origin.x)
+                display_y = int(display_frame.origin.y)
+            except (AttributeError, TypeError):
+                # Fallback: assume primary display at (0, 0)
+                display_x = 0
+                display_y = 0
+
+            rel_x = self._region.x - display_x
+            rel_y = self._region.y - display_y
+
+            # Clamp sourceRect to stay within display bounds (in points).
+            src_x = max(0, rel_x)
+            src_y = max(0, rel_y)
+            src_w = min(self._region.width, display_width_pt - src_x)
+            src_h = min(self._region.height, display_height_pt - src_y)
+
+            if src_w <= 0 or src_h <= 0:
+                raise ScreenCaptureError(
+                    f"Region {self._region} is entirely outside display "
+                    f"bounds ({display_width_pt}x{display_height_pt} at "
+                    f"{display_x},{display_y})"
                 )
+
+            # Output dimensions match source rect (in points — SCK scales
+            # automatically to native resolution).
+            config.setWidth_(src_w)
+            config.setHeight_(src_h)
+            config.setSourceRect_(
+                _make_cg_rect(src_x, src_y, src_w, src_h)
             )
         else:
-            config.setWidth_(display.width())
-            config.setHeight_(display.height())
+            config.setWidth_(display_width_pt)
+            config.setHeight_(display_height_pt)
 
         config.setPixelFormat_(0x42475241)  # kCVPixelFormatType_32BGRA
         config.setShowsCursor_(False)
@@ -293,14 +352,18 @@ class ScreenCapture:
         return config
 
     def _capture_raw_frame(self, display: object, config: object) -> object:
-        """Capture a single raw frame using SCStream.
+        """Capture a single raw frame as a CGImage.
+
+        Uses SCScreenshotManager.captureImageWithFilter which returns a
+        CGImage directly — more reliable than captureSampleBufferWithFilter
+        which can return empty CMSampleBuffers.
 
         Args:
             display: The SCDisplay to capture.
             config: The SCStreamConfiguration to use.
 
         Returns:
-            An SCStreamOutput sample buffer containing the frame data.
+            A CGImage containing the captured frame.
 
         Raises:
             ScreenCaptureError: If the capture operation fails.
@@ -323,11 +386,11 @@ class ScreenCapture:
             result["error"] = error
             frame_ready.set()
 
-        SCScreenshotManager.captureSampleBufferWithFilter_configuration_completionHandler_(
+        SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(
             content_filter, config, screenshot_handler
         )
 
-        if not frame_ready.wait(timeout=10.0):
+        if not _wait_with_runloop(frame_ready, timeout=10.0):
             raise ScreenCaptureError("Timed out waiting for frame capture")
 
         if result["error"] is not None:
@@ -340,11 +403,11 @@ class ScreenCapture:
 
         return result["image"]
 
-    def _convert_to_bgr(self, sample_buffer: object) -> np.ndarray:
-        """Convert a CMSampleBuffer to a BGR numpy array.
+    def _convert_to_bgr(self, cg_image: object) -> np.ndarray:
+        """Convert a CGImage to a BGR numpy array.
 
         Args:
-            sample_buffer: A CMSampleBuffer from SCScreenshotManager.
+            cg_image: A CGImage from SCScreenshotManager.
 
         Returns:
             A numpy array with shape (height, width, 3), dtype uint8, BGR order.
@@ -352,46 +415,58 @@ class ScreenCapture:
         Raises:
             ScreenCaptureError: If conversion fails.
         """
-        import CoreMedia  # type: ignore[import-untyped]
-        import CoreVideo  # type: ignore[import-untyped]
+        import Quartz  # type: ignore[import-untyped]
 
         try:
-            pixel_buffer = CoreMedia.CMSampleBufferGetImageBuffer(
-                sample_buffer
-            )
-            if pixel_buffer is None:
+            width = Quartz.CGImageGetWidth(cg_image)
+            height = Quartz.CGImageGetHeight(cg_image)
+
+            if width == 0 or height == 0:
                 raise ScreenCaptureError(
-                    "Failed to get pixel buffer from sample buffer"
+                    f"CGImage has zero dimensions: {width}x{height}"
                 )
 
-            CoreVideo.CVPixelBufferLockBaseAddress(pixel_buffer, 0)
-            try:
-                base_address = CoreVideo.CVPixelBufferGetBaseAddress(
-                    pixel_buffer
-                )
-                width = CoreVideo.CVPixelBufferGetWidth(pixel_buffer)
-                height = CoreVideo.CVPixelBufferGetHeight(pixel_buffer)
-                bytes_per_row = CoreVideo.CVPixelBufferGetBytesPerRow(
-                    pixel_buffer
-                )
+            # Create a bitmap context to render the CGImage into BGRA
+            bytes_per_row = width * 4
+            color_space = Quartz.CGColorSpaceCreateDeviceRGB()
+            # kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+            # = BGRA pixel format
+            bitmap_info = (
+                Quartz.kCGImageAlphaPremultipliedFirst
+                | Quartz.kCGBitmapByteOrder32Little
+            )
 
-                if base_address is None:
-                    raise ScreenCaptureError(
-                        "Pixel buffer base address is None"
-                    )
-
-                # Create numpy array from the raw buffer (BGRA format)
-                buf = (
-                    np.frombuffer(base_address, dtype=np.uint8)
-                    .reshape(height, bytes_per_row // 1)[:, : width * 4]
-                    .reshape(height, width, 4)
+            context = Quartz.CGBitmapContextCreate(
+                None, width, height, 8, bytes_per_row, color_space, bitmap_info
+            )
+            if context is None:
+                raise ScreenCaptureError(
+                    "Failed to create CGBitmapContext"
                 )
 
-                # Drop alpha channel: BGRA -> BGR
-                bgr_frame = buf[:, :, :3].copy()
+            # Draw the CGImage into the bitmap context
+            rect = Quartz.CGRectMake(0, 0, width, height)
+            Quartz.CGContextDrawImage(context, rect, cg_image)
 
-            finally:
-                CoreVideo.CVPixelBufferUnlockBaseAddress(pixel_buffer, 0)
+            # Extract pixel data from the context
+            data = Quartz.CGBitmapContextGetData(context)
+            if data is None:
+                raise ScreenCaptureError(
+                    "Failed to get bitmap context data"
+                )
+
+            total_bytes = bytes_per_row * height
+            if hasattr(data, "as_buffer"):
+                raw = np.frombuffer(
+                    data.as_buffer(total_bytes), dtype=np.uint8
+                )
+            else:
+                raw = np.frombuffer(data, dtype=np.uint8)
+
+            buf = raw.reshape(height, width, 4)
+
+            # Drop alpha channel: BGRA -> BGR
+            bgr_frame = buf[:, :, :3].copy()
 
             return bgr_frame
 
@@ -399,7 +474,7 @@ class ScreenCapture:
             raise
         except Exception as exc:
             raise ScreenCaptureError(
-                f"Failed to convert sample buffer to BGR array: {exc}"
+                f"Failed to convert CGImage to BGR array: {exc}"
             ) from exc
 
 

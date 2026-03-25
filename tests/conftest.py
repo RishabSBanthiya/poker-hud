@@ -9,8 +9,7 @@ import numpy as np
 import pytest
 from src.detection.card import Card, DetectedCard, Rank, Suit
 from src.detection.card_recognition import CardRecognitionResult
-from src.detection.detection_pipeline import DetectionResult
-from src.detection.player_identifier import PlayerInfo
+from src.detection.detection_pipeline import DetectionResult, PlayerInfo
 from src.engine.hand_history import HandRecord
 from src.stats.connection_manager import ConnectionManager
 from src.stats.hand_repository import HandRepository

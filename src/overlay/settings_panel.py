@@ -3,14 +3,25 @@
 Provides settings management for the overlay, including visibility
 toggles, opacity control, poker client selection, stat display
 preferences, and persistent configuration save/load.
+
+Internally stores mutable settings state that can be converted to/from
+the frozen ``AppConfig`` dataclass via ``get_config()`` and JSON
+serialization.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-from src.common.config import AppConfig, StatsConfig
+from src.common.config import (
+    AppConfig,
+    OverlayConfig,
+    StatsConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,18 +40,105 @@ DEFAULT_CONFIG_PATH = "config/settings.json"
 
 
 @dataclass
+class MutableSettings:
+    """Mutable internal settings state.
+
+    These fields mirror what the UI exposes.  Fields that don't exist on
+    ``AppConfig`` (poker_client, table_size, compact_mode,
+    show_stats_panel, show_solver_panel) are stored here but serialized
+    alongside the config sections in JSON.
+
+    Attributes:
+        opacity: Overlay opacity (0.0-1.0).
+        font_size: Overlay font size in points.
+        position_x: Overlay X position.
+        position_y: Overlay Y position.
+        background_color: Overlay background color hex.
+        text_color: Overlay text color hex.
+        accent_color: Overlay accent color hex.
+        db_path: Path to the SQLite database.
+        poker_client: Selected poker client name.
+        table_size: Number of seats at the table.
+        compact_mode: Whether to use compact stat display.
+        show_stats_panel: Whether to show the stats panel.
+        show_solver_panel: Whether to show the solver panel.
+        stats_config: Stats threshold configuration.
+    """
+
+    opacity: float = 0.9
+    font_size: int = 14
+    position_x: int = 0
+    position_y: int = 0
+    background_color: str = "#1a1a2e"
+    text_color: str = "#e0e0e0"
+    accent_color: str = "#00d4aa"
+    db_path: str = "data/poker_hud.db"
+    poker_client: str = "PokerStars"
+    table_size: int = 9
+    compact_mode: bool = False
+    show_stats_panel: bool = True
+    show_solver_panel: bool = True
+    stats_config: StatsConfig = field(default_factory=StatsConfig)
+
+
+def _settings_from_config(config: AppConfig) -> MutableSettings:
+    """Extract mutable settings from a frozen AppConfig.
+
+    Args:
+        config: Frozen application configuration.
+
+    Returns:
+        A new MutableSettings populated from the config.
+    """
+    return MutableSettings(
+        opacity=config.overlay.opacity,
+        font_size=config.overlay.font_size,
+        position_x=config.overlay.position_x,
+        position_y=config.overlay.position_y,
+        background_color=config.overlay.background_color,
+        text_color=config.overlay.text_color,
+        accent_color=config.overlay.accent_color,
+        db_path=config.stats.db_path,
+        stats_config=config.stats,
+    )
+
+
+def _settings_to_config(settings: MutableSettings) -> AppConfig:
+    """Build an AppConfig from mutable settings.
+
+    Args:
+        settings: Current mutable settings.
+
+    Returns:
+        A frozen AppConfig instance.
+    """
+    return AppConfig(
+        overlay=OverlayConfig(
+            opacity=settings.opacity,
+            font_size=settings.font_size,
+            position_x=settings.position_x,
+            position_y=settings.position_y,
+            background_color=settings.background_color,
+            text_color=settings.text_color,
+            accent_color=settings.accent_color,
+        ),
+        stats=settings.stats_config,
+    )
+
+
+@dataclass
 class SettingsState:
     """Current state of the settings panel UI.
 
     Attributes:
         visible: Whether the settings panel is shown.
-        config: The current application configuration.
+        settings: The mutable internal settings.
         dirty: Whether unsaved changes exist.
         config_path: Path to the config file.
     """
 
     visible: bool = False
-    config: AppConfig = field(default_factory=AppConfig)
+    settings: MutableSettings = field(default_factory=MutableSettings)
     dirty: bool = False
     config_path: str = DEFAULT_CONFIG_PATH
 
@@ -52,6 +150,10 @@ class SettingsPanel:
     opacity, poker client selection, stat display preferences,
     and database path. Supports save/load to a JSON config file.
 
+    Internally uses ``MutableSettings`` so values can be changed
+    freely, then reconstructs a frozen ``AppConfig`` on demand via
+    ``get_config()``.
+
     Args:
         config: Initial application configuration.
         config_path: Path to save/load configuration file.
@@ -62,8 +164,10 @@ class SettingsPanel:
         config: AppConfig | None = None,
         config_path: str = DEFAULT_CONFIG_PATH,
     ) -> None:
+        initial_config = config or AppConfig()
+        settings = _settings_from_config(initial_config)
         self._state = SettingsState(
-            config=config or AppConfig(),
+            settings=settings,
             config_path=config_path,
         )
 
@@ -88,34 +192,33 @@ class SettingsPanel:
         return self._state.dirty
 
     def get_config(self) -> AppConfig:
-        """Get the current application configuration.
+        """Build and return an AppConfig from the current mutable settings.
 
         Returns:
             Current AppConfig instance.
         """
-        return self._state.config
+        return _settings_to_config(self._state.settings)
 
     def apply_config(self, config: AppConfig) -> None:
-        """Apply a new configuration.
+        """Apply a new configuration by extracting its values.
 
         Args:
             config: New application configuration to apply.
         """
-        self._state.config = config
+        self._state.settings = _settings_from_config(config)
         self._state.dirty = True
         logger.info("Configuration applied (unsaved)")
 
     # --- Overlay settings ---
 
     def set_overlay_visible(self, visible: bool) -> None:
-        """Toggle overlay visibility in configuration.
+        """Toggle overlay sub-panel visibility.
 
         Args:
-            visible: Whether the overlay should be visible.
+            visible: Whether the overlay panels should be visible.
         """
-        # Stats and solver panels follow overlay visibility
-        self._state.config.overlay.show_stats_panel = visible
-        self._state.config.overlay.show_solver_panel = visible
+        self._state.settings.show_stats_panel = visible
+        self._state.settings.show_solver_panel = visible
         self._state.dirty = True
 
     def set_opacity(self, opacity: float) -> None:
@@ -131,7 +234,7 @@ class SettingsPanel:
             raise ValueError(
                 f"Opacity must be between 0.0 and 1.0, got {opacity}"
             )
-        self._state.config.overlay.opacity = opacity
+        self._state.settings.opacity = opacity
         self._state.dirty = True
 
     def set_font_size(self, font_size: float) -> None:
@@ -145,7 +248,7 @@ class SettingsPanel:
         """
         if font_size <= 0:
             raise ValueError(f"Font size must be positive, got {font_size}")
-        self._state.config.overlay.font_size = font_size
+        self._state.settings.font_size = int(font_size)
         self._state.dirty = True
 
     def set_compact_mode(self, compact: bool) -> None:
@@ -154,7 +257,7 @@ class SettingsPanel:
         Args:
             compact: True for compact mode, False for detailed.
         """
-        self._state.config.overlay.compact_mode = compact
+        self._state.settings.compact_mode = compact
         self._state.dirty = True
 
     # --- Poker client settings ---
@@ -173,7 +276,7 @@ class SettingsPanel:
                 f"Unsupported client '{client}'. "
                 f"Supported: {SUPPORTED_CLIENTS}"
             )
-        self._state.config.poker_client = client
+        self._state.settings.poker_client = client
         self._state.dirty = True
 
     def get_poker_client(self) -> str:
@@ -182,7 +285,7 @@ class SettingsPanel:
         Returns:
             Name of the selected poker client.
         """
-        return self._state.config.poker_client
+        return self._state.settings.poker_client
 
     # --- Database settings ---
 
@@ -197,7 +300,7 @@ class SettingsPanel:
         """
         if not path.strip():
             raise ValueError("Database path cannot be empty")
-        self._state.config.db_path = path
+        self._state.settings.db_path = path
         self._state.dirty = True
 
     def get_db_path(self) -> str:
@@ -206,7 +309,7 @@ class SettingsPanel:
         Returns:
             Path to the SQLite database file.
         """
-        return self._state.config.db_path
+        return self._state.settings.db_path
 
     # --- Table settings ---
 
@@ -221,7 +324,7 @@ class SettingsPanel:
         """
         if not 2 <= size <= 10:
             raise ValueError(f"Table size must be 2-10, got {size}")
-        self._state.config.table_size = size
+        self._state.settings.table_size = size
         self._state.dirty = True
 
     # --- Stats threshold settings ---
@@ -232,10 +335,93 @@ class SettingsPanel:
         Args:
             stats_config: New stats threshold configuration.
         """
-        self._state.config.stats = stats_config
+        self._state.settings.stats_config = stats_config
         self._state.dirty = True
 
     # --- Persistence ---
+
+    def _to_dict(self) -> dict[str, Any]:
+        """Serialize the mutable settings to a dict for JSON persistence.
+
+        Returns:
+            Nested dict suitable for JSON serialization.
+        """
+        s = self._state.settings
+        return {
+            "overlay": {
+                "opacity": s.opacity,
+                "font_size": s.font_size,
+                "position_x": s.position_x,
+                "position_y": s.position_y,
+                "background_color": s.background_color,
+                "text_color": s.text_color,
+                "accent_color": s.accent_color,
+            },
+            "stats": {
+                "db_path": s.stats_config.db_path,
+                "max_connections": s.stats_config.max_connections,
+                "wal_mode": s.stats_config.wal_mode,
+                "vpip_loose_threshold": s.stats_config.vpip_loose_threshold,
+                "vpip_tight_threshold": s.stats_config.vpip_tight_threshold,
+                "pfr_loose_threshold": s.stats_config.pfr_loose_threshold,
+                "pfr_tight_threshold": s.stats_config.pfr_tight_threshold,
+            },
+            "poker_client": s.poker_client,
+            "table_size": s.table_size,
+            "compact_mode": s.compact_mode,
+            "show_stats_panel": s.show_stats_panel,
+            "show_solver_panel": s.show_solver_panel,
+            "db_path": s.db_path,
+        }
+
+    def _from_dict(self, data: dict[str, Any]) -> None:
+        """Restore mutable settings from a dict loaded from JSON.
+
+        Args:
+            data: Dict previously produced by ``_to_dict``.
+        """
+        s = self._state.settings
+        overlay = data.get("overlay", {})
+        s.opacity = overlay.get("opacity", s.opacity)
+        s.font_size = overlay.get("font_size", s.font_size)
+        s.position_x = overlay.get("position_x", s.position_x)
+        s.position_y = overlay.get("position_y", s.position_y)
+        s.background_color = overlay.get("background_color", s.background_color)
+        s.text_color = overlay.get("text_color", s.text_color)
+        s.accent_color = overlay.get("accent_color", s.accent_color)
+
+        stats_data = data.get("stats", {})
+        if stats_data:
+            s.stats_config = StatsConfig(
+                db_path=stats_data.get("db_path", s.stats_config.db_path),
+                max_connections=stats_data.get(
+                    "max_connections", s.stats_config.max_connections
+                ),
+                wal_mode=stats_data.get("wal_mode", s.stats_config.wal_mode),
+                vpip_loose_threshold=stats_data.get(
+                    "vpip_loose_threshold",
+                    s.stats_config.vpip_loose_threshold,
+                ),
+                vpip_tight_threshold=stats_data.get(
+                    "vpip_tight_threshold",
+                    s.stats_config.vpip_tight_threshold,
+                ),
+                pfr_loose_threshold=stats_data.get(
+                    "pfr_loose_threshold",
+                    s.stats_config.pfr_loose_threshold,
+                ),
+                pfr_tight_threshold=stats_data.get(
+                    "pfr_tight_threshold",
+                    s.stats_config.pfr_tight_threshold,
+                ),
+            )
+
+        s.poker_client = data.get("poker_client", s.poker_client)
+        s.table_size = data.get("table_size", s.table_size)
+        s.compact_mode = data.get("compact_mode", s.compact_mode)
+        s.show_stats_panel = data.get("show_stats_panel", s.show_stats_panel)
+        s.show_solver_panel = data.get("show_solver_panel", s.show_solver_panel)
+        s.db_path = data.get("db_path", s.db_path)
 
     def save_config(self, path: str | None = None) -> None:
         """Save current configuration to a JSON file.
@@ -244,7 +430,10 @@ class SettingsPanel:
             path: Optional override path. Uses default if not provided.
         """
         save_path = path or self._state.config_path
-        self._state.config.save(save_path)
+        data = self._to_dict()
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        save_file.write_text(json.dumps(data, indent=2))
         self._state.dirty = False
         logger.info("Configuration saved to %s", save_path)
 
@@ -262,15 +451,20 @@ class SettingsPanel:
             json.JSONDecodeError: If config file is invalid.
         """
         load_path = path or self._state.config_path
-        config = AppConfig.load(load_path)
-        self._state.config = config
+        load_file = Path(load_path)
+        if not load_file.exists():
+            raise FileNotFoundError(
+                f"Configuration file not found: {load_path}"
+            )
+        data = json.loads(load_file.read_text())
+        self._from_dict(data)
         self._state.dirty = False
         logger.info("Configuration loaded from %s", load_path)
-        return config
+        return self.get_config()
 
     def reset_to_defaults(self) -> None:
         """Reset all settings to defaults."""
-        self._state.config = AppConfig()
+        self._state.settings = MutableSettings()
         self._state.dirty = True
         logger.info("Configuration reset to defaults")
 
@@ -280,15 +474,15 @@ class SettingsPanel:
         Returns:
             Multi-line settings summary string.
         """
-        cfg = self._state.config
+        s = self._state.settings
         lines = [
-            f"Poker Client: {cfg.poker_client}",
-            f"Table Size: {cfg.table_size}",
-            f"Opacity: {cfg.overlay.opacity:.0%}",
-            f"Font Size: {cfg.overlay.font_size:.0f}pt",
-            f"Compact Mode: {'On' if cfg.overlay.compact_mode else 'Off'}",
-            f"Stats Panel: {'On' if cfg.overlay.show_stats_panel else 'Off'}",
-            f"Solver Panel: {'On' if cfg.overlay.show_solver_panel else 'Off'}",
-            f"DB Path: {cfg.db_path}",
+            f"Poker Client: {s.poker_client}",
+            f"Table Size: {s.table_size}",
+            f"Opacity: {s.opacity:.0%}",
+            f"Font Size: {s.font_size}pt",
+            f"Compact Mode: {'On' if s.compact_mode else 'Off'}",
+            f"Stats Panel: {'On' if s.show_stats_panel else 'Off'}",
+            f"Solver Panel: {'On' if s.show_solver_panel else 'Off'}",
+            f"DB Path: {s.db_path}",
         ]
         return "\n".join(lines)

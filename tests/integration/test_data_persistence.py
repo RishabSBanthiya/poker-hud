@@ -14,11 +14,10 @@ from pathlib import Path
 from src.detection.card import Card, Rank, Suit
 from src.engine.game_state import (
     ActionType,
-    HandState,
     PlayerAction,
-    PlayerState,
     Street,
 )
+from src.engine.hand_history import HandState, PlayerState
 from src.engine.hand_history import HandHistoryParser
 from src.stats.connection_manager import ConnectionManager
 from src.stats.hand_repository import HandRepository
@@ -57,10 +56,10 @@ class TestHandHistoryPersistence:
                 PlayerState(name="Bob", seat_index=1),
             ],
             actions=[
-                PlayerAction("Alice", ActionType.RAISE, 3.0, Street.PREFLOP),
-                PlayerAction("Bob", ActionType.CALL, 3.0, Street.PREFLOP),
-                PlayerAction("Alice", ActionType.BET, 5.0, Street.FLOP),
-                PlayerAction("Bob", ActionType.CALL, 5.0, Street.FLOP),
+                PlayerAction(action_type=ActionType.RAISE, amount=3.0, street=Street.PREFLOP, player_name="Alice"),
+                PlayerAction(action_type=ActionType.CALL, amount=3.0, street=Street.PREFLOP, player_name="Bob"),
+                PlayerAction(action_type=ActionType.BET, amount=5.0, street=Street.FLOP, player_name="Alice"),
+                PlayerAction(action_type=ActionType.CALL, amount=5.0, street=Street.FLOP, player_name="Bob"),
             ],
             pot=16.0,
             big_blind=1.0,

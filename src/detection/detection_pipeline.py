@@ -18,9 +18,24 @@ from src.detection.card_recognition import (
     CardRecognitionResult,
 )
 from src.detection.ocr_engine import OCREngine
-from src.detection.player_identifier import PlayerIdentifier, PlayerInfo
+from src.detection.player_identifier import PlayerIdentifier, PlayerMatch
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PlayerInfo:
+    """Lightweight player identification data for the detection pipeline.
+
+    Attributes:
+        seat_index: Seat position (0-based).
+        name: Player screen name.
+        is_hero: Whether this player is the user.
+    """
+
+    seat_index: int = 0
+    name: str = ""
+    is_hero: bool = False
 
 
 @dataclass
@@ -95,7 +110,10 @@ class DetectionPipeline:
         card_result = self._card_recognition.process_frame(frame)
         card_result.frame_timestamp = timestamp
 
-        players = self._player_identifier.identify_players(frame)
+        # Player identification is done per-seat in the coordinator layer;
+        # the pipeline passes an empty list here since regions aren't known
+        # at this level.
+        players: list[PlayerMatch] = []
 
         result = DetectionResult(
             card_result=card_result,

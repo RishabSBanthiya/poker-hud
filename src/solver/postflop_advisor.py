@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class Action(Enum):
+    """Postflop action enum for display compatibility."""
+
+    RAISE = auto()
+    ALL_IN = auto()
+    CALL = auto()
+    CHECK = auto()
+    FOLD = auto()
+
+
 class DrawType(Enum):
     """Types of drawing hands."""
 

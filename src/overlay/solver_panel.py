@@ -1,7 +1,7 @@
 """Strategy advisor display panel for the overlay.
 
 Displays GTO solver recommendations including recommended action,
-equity, pot odds, opponent range estimation, and draw information.
+equity, opponent range estimation, and draw information.
 """
 
 from __future__ import annotations
@@ -10,8 +10,11 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
-from src.solver.advisor_coordinator import DrawInfo, StrategyAdvice
-from src.solver.postflop_advisor import Action
+from src.solver.advisor_coordinator import (
+    ActionRecommendation,
+    DrawInfo,
+    StrategyAdvice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +32,20 @@ class ActionColor(Enum):
 
 
 # Map actions to display colors
-_ACTION_COLORS: dict[Action, ActionColor] = {
-    Action.RAISE: ActionColor.GREEN,
-    Action.ALL_IN: ActionColor.GREEN,
-    Action.CALL: ActionColor.YELLOW,
-    Action.CHECK: ActionColor.YELLOW,
-    Action.FOLD: ActionColor.RED,
+_ACTION_COLORS: dict[ActionRecommendation, ActionColor] = {
+    ActionRecommendation.RAISE: ActionColor.GREEN,
+    ActionRecommendation.ALL_IN: ActionColor.GREEN,
+    ActionRecommendation.CALL: ActionColor.YELLOW,
+    ActionRecommendation.CHECK: ActionColor.YELLOW,
+    ActionRecommendation.FOLD: ActionColor.RED,
 }
 
 
-def get_action_color(action: Action) -> ActionColor:
+def get_action_color(action: ActionRecommendation) -> ActionColor:
     """Get the display color for an action.
 
     Args:
-        action: The poker action.
+        action: The poker action recommendation.
 
     Returns:
         Color category for the action.
@@ -50,16 +53,16 @@ def get_action_color(action: Action) -> ActionColor:
     return _ACTION_COLORS.get(action, ActionColor.WHITE)
 
 
-def format_action(action: Action) -> str:
+def format_action(action: ActionRecommendation) -> str:
     """Format an action for display.
 
     Args:
-        action: The poker action.
+        action: The poker action recommendation.
 
     Returns:
         Human-readable action string.
     """
-    return action.value.upper()
+    return action.name.upper()
 
 
 @dataclass
@@ -71,8 +74,8 @@ class SolverDisplayState:
         expanded: Whether the panel is in expanded view.
         action_text: Formatted action recommendation text.
         equity_text: Formatted equity display text.
-        pot_odds_text: Formatted pot odds display text.
-        range_text: Opponent range summary text.
+        sizing_text: Formatted recommended sizing text.
+        reasoning_text: Combined reasoning text.
         draw_text: Draw information text.
         action_color: Color for the action display.
     """
@@ -81,8 +84,8 @@ class SolverDisplayState:
     expanded: bool = False
     action_text: str = ""
     equity_text: str = ""
-    pot_odds_text: str = ""
-    range_text: str = ""
+    sizing_text: str = ""
+    reasoning_text: str = ""
     draw_text: str = ""
     action_color: ActionColor = ActionColor.WHITE
 
@@ -90,7 +93,7 @@ class SolverDisplayState:
 class SolverPanel:
     """Display panel for GTO strategy recommendations.
 
-    Shows the recommended action, equity, pot odds, opponent range,
+    Shows the recommended action, equity, sizing, opponent ranges,
     and draw information in compact or expanded view.
 
     Args:
@@ -131,10 +134,9 @@ class SolverPanel:
         self._format_advice(advice)
 
         logger.debug(
-            "Solver panel updated: %s (equity=%.1f%%, pot_odds=%.1f%%)",
+            "Solver panel updated: %s (equity=%.1f%%)",
             self._state.action_text,
-            advice.equity,
-            advice.pot_odds,
+            advice.equity * 100,
         )
 
     def clear(self) -> None:
@@ -142,8 +144,8 @@ class SolverPanel:
         self._state.advice = None
         self._state.action_text = ""
         self._state.equity_text = ""
-        self._state.pot_odds_text = ""
-        self._state.range_text = ""
+        self._state.sizing_text = ""
+        self._state.reasoning_text = ""
         self._state.draw_text = ""
         self._state.action_color = ActionColor.WHITE
 
@@ -151,16 +153,19 @@ class SolverPanel:
         """Get the compact view text for overlay display.
 
         Returns:
-            Single-line summary: "RAISE | Eq:65% PO:33%"
+            Single-line summary: "RAISE | Eq:65% Size:75%"
         """
         if self._state.advice is None:
             return ""
 
         action = self._state.action_text
         equity = self._state.equity_text
-        pot_odds = self._state.pot_odds_text
 
-        return f"{action} | {equity} {pot_odds}"
+        parts = [action, equity]
+        if self._state.sizing_text:
+            parts.append(self._state.sizing_text)
+
+        return " | ".join(parts)
 
     def get_expanded_text(self) -> str:
         """Get the expanded view text for overlay display.
@@ -173,19 +178,18 @@ class SolverPanel:
 
         lines = [
             f"Action: {self._state.action_text}",
-            f"Equity: {self._state.equity_text}  "
-            f"Pot Odds: {self._state.pot_odds_text}",
+            f"Equity: {self._state.equity_text}",
         ]
 
-        if self._state.range_text:
-            lines.append(f"Range: {self._state.range_text}")
+        if self._state.sizing_text:
+            lines.append(f"Sizing: {self._state.sizing_text}")
 
         if self._state.draw_text:
             lines.append(f"Draws: {self._state.draw_text}")
 
         advice = self._state.advice
-        if advice.recommendation.reasoning:
-            lines.append(f"Note: {advice.recommendation.reasoning}")
+        if advice.reasoning:
+            lines.append(f"Note: {'; '.join(advice.reasoning)}")
 
         return "\n".join(lines)
 
@@ -214,16 +218,23 @@ class SolverPanel:
             advice: Strategy advice to format.
         """
         rec = advice.recommendation
-        self._state.action_text = format_action(rec.action)
-        self._state.action_color = get_action_color(rec.action)
-        self._state.equity_text = f"Eq:{advice.equity:.0f}%"
-        self._state.pot_odds_text = f"PO:{advice.pot_odds:.0f}%"
-        self._state.range_text = advice.opponent_range_summary
+        self._state.action_text = format_action(rec)
+        self._state.action_color = get_action_color(rec)
+        self._state.equity_text = f"Eq:{advice.equity * 100:.0f}%"
 
-        if advice.draw_info is not None:
-            self._state.draw_text = self._format_draw_info(advice.draw_info)
+        if advice.recommended_sizing is not None:
+            self._state.sizing_text = (
+                f"Size:{advice.recommended_sizing * 100:.0f}%"
+            )
         else:
-            self._state.draw_text = ""
+            self._state.sizing_text = ""
+
+        if advice.reasoning:
+            self._state.reasoning_text = "; ".join(advice.reasoning)
+        else:
+            self._state.reasoning_text = ""
+
+        self._state.draw_text = ""
 
     @staticmethod
     def _format_draw_info(draw_info: DrawInfo) -> str:
@@ -237,12 +248,6 @@ class SolverPanel:
         """
         if draw_info.draw_description:
             return f"{draw_info.draw_description} ({draw_info.outs} outs)"
-
-        parts = []
-        if draw_info.has_flush_draw:
-            parts.append("Flush draw")
-        if draw_info.has_straight_draw:
-            parts.append("Straight draw")
-        if parts:
-            return f"{', '.join(parts)} ({draw_info.outs} outs)"
+        if draw_info.outs > 0:
+            return f"{draw_info.outs} outs ({draw_info.probability:.0%})"
         return ""

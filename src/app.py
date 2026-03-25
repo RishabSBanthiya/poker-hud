@@ -10,29 +10,33 @@ import logging
 import signal
 import threading
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
-from src.capture.capture_pipeline import CapturePipeline
-from src.capture.frame_poller import FramePoller
-from src.capture.screen_capture import ScreenCapture
-from src.capture.window_detector import WindowDetector
+from src.capture.pipeline import CapturePipeline, PipelineConfig
+from src.capture.window_detector import WindowInfo
 from src.common.config import AppConfig
 from src.detection.card_recognition import CardRecognitionPipeline
-from src.detection.detection_pipeline import DetectionPipeline, DetectionResult
 from src.detection.ocr_engine import OCREngine
 from src.detection.player_identifier import PlayerIdentifier
-from src.engine.game_state import HandState
-from src.engine.game_state_coordinator import GameStateCoordinator
-from src.engine.hand_history import HandRecord
-from src.engine.hand_phase_tracker import HandPhaseTracker
-from src.solver.equity_calculator import EquityCalculator
-from src.solver.strategy_advisor import StrategyAdvisorCoordinator
-from src.stats.connection_manager import ConnectionManager
-from src.stats.hand_repository import HandRepository
-from src.stats.player_stats_repository import PlayerStatsRepository
-from src.stats.stats_aggregator import StatsAggregator
+from src.detection.validation import DetectionResult
+from src.engine.coordinator import GameStateCoordinator, StateChangeEvent
+from src.engine.game_state import GameState
+from src.overlay.hud_stats import StatsFormatter
+from src.overlay.overlay_window import (
+    OverlayConfig,
+    OverlayWindow,
+    PanelType,
+    WindowInfo as OverlayWindowInfo,
+)
+from src.solver.advisor_coordinator import (
+    ActionRecommendation,
+    StrategyAdvisorCoordinator,
+    StrategyAdvice,
+)
+from src.stats.aggregator import StatsAggregator
+from src.stats.connection import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -56,28 +60,32 @@ class PokerHUDApp:
     Args:
         config: Application configuration. Uses defaults if None.
         enable_overlay: Whether to create the overlay window.
+        debug: Whether to enable debug-level logging.
     """
 
     def __init__(
         self,
         config: Optional[AppConfig] = None,
         enable_overlay: bool = True,
+        debug: bool = False,
     ) -> None:
         self._config = config or AppConfig()
         self._enable_overlay = enable_overlay
+        self._debug = debug
         self._state = AppState.CREATED
         self._shutdown_event = threading.Event()
 
         # Subsystem references (initialized in initialize())
         self._connection_manager: Optional[ConnectionManager] = None
         self._capture_pipeline: Optional[CapturePipeline] = None
-        self._detection_pipeline: Optional[DetectionPipeline] = None
+        self._card_recognition: Optional[CardRecognitionPipeline] = None
+        self._ocr_engine: Optional[OCREngine] = None
+        self._player_identifier: Optional[PlayerIdentifier] = None
         self._game_state_coordinator: Optional[GameStateCoordinator] = None
         self._stats_aggregator: Optional[StatsAggregator] = None
         self._strategy_advisor: Optional[StrategyAdvisorCoordinator] = None
-        self._overlay_text_callback: Optional[
-            callable  # type: ignore[type-arg]
-        ] = None
+        self._overlay: Optional[OverlayWindow] = None
+        self._stats_formatter: Optional[StatsFormatter] = None
 
     @property
     def state(self) -> AppState:
@@ -100,11 +108,6 @@ class PokerHUDApp:
         return self._capture_pipeline
 
     @property
-    def detection_pipeline(self) -> Optional[DetectionPipeline]:
-        """Detection pipeline instance."""
-        return self._detection_pipeline
-
-    @property
     def game_state_coordinator(self) -> Optional[GameStateCoordinator]:
         """Game state coordinator instance."""
         return self._game_state_coordinator
@@ -119,20 +122,23 @@ class PokerHUDApp:
         """Strategy advisor instance."""
         return self._strategy_advisor
 
+    @property
+    def overlay(self) -> Optional[OverlayWindow]:
+        """Overlay window instance."""
+        return self._overlay
+
     def initialize(self) -> None:
         """Initialize all subsystems in dependency order.
 
-        1. Configuration (already loaded)
-        2. Logging
-        3. Database / connection manager
-        4. Capture pipeline (window detector, screen capture, frame poller)
-        5. Detection pipeline (card recognition, OCR, player ID)
-        6. Game state engine (coordinator, hand tracker)
-        7. Stats aggregator (connected to database)
-        8. Strategy advisor
+        1. Logging
+        2. Database / connection manager
+        3. Capture pipeline
+        4. Detection components (card recognition, OCR, player ID)
+        5. Game state engine (coordinator)
+        6. Stats aggregator
+        7. Strategy advisor
+        8. Wire subsystems together via callbacks
         9. Overlay (if enabled)
-
-        Then wires subsystems together via callbacks.
         """
         if self._state not in (AppState.CREATED, AppState.STOPPED):
             logger.warning(
@@ -146,66 +152,61 @@ class PokerHUDApp:
         self._setup_logging()
 
         # 2. Database
-        self._connection_manager = ConnectionManager(
-            db_path=self._config.stats.db_path
-        )
-        self._connection_manager.initialize()
+        self._connection_manager = ConnectionManager(self._config.stats)
 
         # 3. Capture pipeline
-        window_detector = WindowDetector(
-            title_pattern=self._config.capture.window_title_pattern
+        pipeline_config = PipelineConfig(
+            polling_interval=self._config.capture.polling_interval_ms / 1000.0,
+            change_threshold=self._config.capture.change_threshold,
         )
-        screen_capture = ScreenCapture()
-        frame_poller = FramePoller(
-            screen_capture=screen_capture,
-            poll_interval_ms=self._config.capture.poll_interval_ms,
-            change_threshold=self._config.capture.frame_change_threshold,
-        )
-        self._capture_pipeline = CapturePipeline(
-            window_detector=window_detector,
-            screen_capture=screen_capture,
-            frame_poller=frame_poller,
-        )
+        self._capture_pipeline = CapturePipeline(config=pipeline_config)
 
-        # 4. Detection pipeline
-        card_recognition = CardRecognitionPipeline(
-            template_dir=self._config.detection.template_dir,
+        # 4. Detection components
+        self._card_recognition = CardRecognitionPipeline(
+            template_dir=self._config.detection.template_path,
             confidence_threshold=self._config.detection.confidence_threshold,
         )
-        ocr_engine = OCREngine()
-        player_identifier = PlayerIdentifier(ocr_engine=ocr_engine)
-        self._detection_pipeline = DetectionPipeline(
-            card_recognition=card_recognition,
-            ocr_engine=ocr_engine,
-            player_identifier=player_identifier,
-        )
-        self._detection_pipeline.initialize()
+        self._card_recognition.initialize()
+
+        self._ocr_engine = OCREngine()
+
+        self._player_identifier = PlayerIdentifier()
 
         # 5. Game state engine
-        hand_tracker = HandPhaseTracker()
-        self._game_state_coordinator = GameStateCoordinator(
-            hand_phase_tracker=hand_tracker
-        )
+        self._game_state_coordinator = GameStateCoordinator()
 
         # 6. Stats aggregator
-        hand_repo = HandRepository(self._connection_manager)
-        stats_repo = PlayerStatsRepository(self._connection_manager)
-        self._stats_aggregator = StatsAggregator(
-            hand_repo=hand_repo,
-            stats_repo=stats_repo,
-            min_hands=self._config.stats.min_hands_for_stats,
-        )
+        self._stats_aggregator = StatsAggregator()
 
         # 7. Strategy advisor
-        equity_calc = EquityCalculator(
-            num_simulations=self._config.solver.equity_simulations
-        )
-        self._strategy_advisor = StrategyAdvisorCoordinator(
-            equity_calculator=equity_calc
-        )
+        self._strategy_advisor = StrategyAdvisorCoordinator()
 
         # 8. Wire subsystems together
         self._wire_subsystems()
+
+        # 9. Overlay (if enabled)
+        if self._enable_overlay:
+            # Position overlay in the top-right of the screen initially
+            screen_w, screen_h = OverlayWindow.screen_size()
+            overlay_w = 520.0
+            overlay_h = 50.0
+            margin = 20.0
+            overlay_config = OverlayConfig(
+                x=screen_w - overlay_w - margin,
+                y=screen_h - overlay_h - margin,
+                width=overlay_w,
+                height=overlay_h,
+                font_size=16.0,
+                text_color=(0.0, 1.0, 0.4, 1.0),
+                bg_color=(0.1, 0.1, 0.1, 0.75),
+            )
+            self._overlay = OverlayWindow(
+                config=overlay_config,
+                text="Poker HUD — Waiting for table...",
+            )
+            self._stats_formatter = StatsFormatter(self._config.stats)
+            self._overlay.create()
+            logger.info("Overlay window created")
 
         self._state = AppState.INITIALIZED
         logger.info("Poker HUD application initialized successfully")
@@ -214,67 +215,167 @@ class PokerHUDApp:
         """Connect subsystems via callbacks to form the data pipeline.
 
         Data flow:
-            Capture -> Detection -> Game State -> Stats + Solver -> Overlay
+            Capture -> Detection -> Game State Coordinator -> Stats + Solver -> Overlay
         """
-        # Capture -> Detection: frame callback
-        if self._capture_pipeline and self._detection_pipeline:
-            self._capture_pipeline.set_frame_callback(
+        # Capture -> frame handler (runs detection + feeds coordinator)
+        if self._capture_pipeline:
+            self._capture_pipeline.register_handler(
                 self._on_frame_captured
             )
 
-        # Detection -> Game State: detection result callback
-        if self._detection_pipeline and self._game_state_coordinator:
-            self._detection_pipeline.set_result_callback(
-                self._on_detection_result
+        # Game State -> Stats + Solver: state change events
+        if self._game_state_coordinator:
+            if self._stats_aggregator:
+                self._game_state_coordinator.on_new_hand(
+                    self._on_new_hand_event
+                )
+            if self._strategy_advisor:
+                self._game_state_coordinator.on_state_change(
+                    self._on_state_change_event
+                )
+
+        # Solver -> Overlay: advice ready callback
+        if self._strategy_advisor:
+            self._strategy_advisor.on_advice_ready(
+                self._on_advice_ready
             )
 
-        # Game State -> Stats: completed hand callback
-        if self._game_state_coordinator and self._stats_aggregator:
-            self._game_state_coordinator.set_hand_complete_callback(
-                self._on_hand_complete
-            )
+    def _on_frame_captured(
+        self, frame: np.ndarray, window: WindowInfo
+    ) -> None:
+        """Handle a newly captured frame.
 
-        # Game State -> Solver: state change callback
-        if self._game_state_coordinator and self._strategy_advisor:
-            self._game_state_coordinator.set_state_change_callback(
-                self._on_state_change
-            )
-
-    def _on_frame_captured(self, frame: np.ndarray) -> None:
-        """Handle a newly captured frame by passing it to detection.
+        Runs the detection pipeline on the frame, feeds results into
+        the game state coordinator, and repositions the overlay.
 
         Args:
             frame: BGR numpy array of the captured frame.
+            window: Info about the source window.
         """
-        if self._detection_pipeline is not None:
-            self._detection_pipeline.process_frame(frame)
+        logger.debug(
+            "Frame captured from '%s' (%dx%d)",
+            window.title,
+            frame.shape[1],
+            frame.shape[0],
+        )
 
-    def _on_detection_result(self, result: DetectionResult) -> None:
-        """Handle detection results by updating game state.
+        # Keep overlay positioned over the poker window (must run on main thread)
+        if self._overlay is not None:
+            overlay_win = OverlayWindowInfo(
+                x=window.x,
+                y=window.y,
+                width=window.width,
+                height=window.height,
+                title=window.title,
+                window_id=window.window_id,
+            )
+            overlay = self._overlay
+            title = window.title
 
-        Args:
-            result: Combined detection result.
-        """
+            def _reposition() -> None:
+                overlay.attach_to_window(overlay_win)
+                # Update main text to show we're tracking a table
+                if overlay.text.startswith("Poker HUD"):
+                    overlay.set_text(f"Tracking: {title}")
+
+            self._run_on_main_thread(_reposition)
+
+        # Run card recognition on the frame
+        detection_result = DetectionResult()
+        if self._card_recognition is not None:
+            card_result = self._card_recognition.process_frame(frame)
+            detection_result.community_cards = [
+                d.card for d in card_result.community_cards
+            ]
+            # Hole cards go to the hero seat (seat 0 by default)
+            if card_result.hole_cards:
+                hero_seat = 0
+                if self._game_state_coordinator is not None:
+                    hero_seat = self._game_state_coordinator._state.hero_seat
+                detection_result.player_cards[hero_seat] = [
+                    d.card for d in card_result.hole_cards
+                ]
+
+        # Feed detection result into game state coordinator
         if self._game_state_coordinator is not None:
-            self._game_state_coordinator.process_detection(result)
+            self._game_state_coordinator.process_frame(detection_result)
 
-    def _on_hand_complete(self, record: HandRecord) -> None:
-        """Handle a completed hand by updating stats.
+    def _on_new_hand_event(self, event: StateChangeEvent) -> None:
+        """Handle a new hand event from the game state coordinator.
+
+        Processes the completed hand through the stats aggregator.
 
         Args:
-            record: The completed hand record.
+            event: The state change event containing the game state.
         """
         if self._stats_aggregator is not None:
-            self._stats_aggregator.process_hand(record)
+            self._stats_aggregator.process_completed_hand(event.state)
 
-    def _on_state_change(self, hand_state: HandState) -> None:
-        """Handle game state changes by requesting solver advice.
+    def _on_state_change_event(self, event: StateChangeEvent) -> None:
+        """Handle game state changes by requesting solver advice and updating overlay.
 
         Args:
-            hand_state: Updated hand state.
+            event: The state change event containing the game state.
         """
+        all_stats = {}
+        if self._stats_aggregator is not None:
+            all_stats = self._stats_aggregator.get_all_stats()
+
         if self._strategy_advisor is not None:
-            self._strategy_advisor.analyze_state(hand_state)
+            self._strategy_advisor.get_advice_async(event.state, all_stats)
+
+        # Update overlay with current stats
+        self._update_overlay_stats(all_stats)
+
+    def _on_advice_ready(self, advice: StrategyAdvice) -> None:
+        """Handle solver advice results and update the overlay.
+
+        Args:
+            advice: Computed strategy advice.
+        """
+        if self._overlay is None:
+            return
+
+        # Format advice for display
+        rec = advice.recommendation.name
+        equity_pct = f"{advice.equity:.0%}"
+        sizing = ""
+        if advice.recommended_sizing is not None:
+            sizing = f" ({advice.recommended_sizing:.0%} pot)"
+        advice_text = f"{rec} | Equity: {equity_pct}{sizing}"
+        overlay = self._overlay
+
+        def _update_advice() -> None:
+            overlay.set_text(advice_text)
+            overlay.set_panel_content(PanelType.SOLVER, advice_text)
+
+        self._run_on_main_thread(_update_advice)
+
+    def _update_overlay_stats(
+        self, all_stats: dict
+    ) -> None:
+        """Push current player stats to the overlay.
+
+        Args:
+            all_stats: Dict mapping player name to PlayerStats.
+        """
+        if self._overlay is None or self._stats_formatter is None:
+            return
+
+        stats_parts = []
+        for player_name, player_stats in all_stats.items():
+            formatted = self._stats_formatter.format_compact(player_stats)
+            stats_parts.append(f"{player_name}: {formatted}")
+
+        if stats_parts:
+            stats_text = " | ".join(stats_parts)
+            overlay = self._overlay
+
+            def _update() -> None:
+                overlay.set_text(stats_text)
+                overlay.set_panel_content(PanelType.STATS, stats_text)
+
+            self._run_on_main_thread(_update)
 
     def start(self) -> None:
         """Start all subsystems and begin processing.
@@ -293,6 +394,9 @@ class PokerHUDApp:
         if self._capture_pipeline is not None:
             self._capture_pipeline.start()
 
+        if self._overlay is not None:
+            self._overlay.show()
+
         self._state = AppState.RUNNING
         logger.info("Poker HUD is running")
 
@@ -304,14 +408,17 @@ class PokerHUDApp:
         logger.info("Stopping Poker HUD...")
 
         # Stop in reverse order of initialization
+        if self._overlay is not None:
+            self._overlay.close()
+
+        if self._strategy_advisor is not None:
+            self._strategy_advisor.shutdown()
+
         if self._capture_pipeline is not None:
             self._capture_pipeline.stop()
 
-        if self._detection_pipeline is not None:
-            self._detection_pipeline.shutdown()
-
         if self._connection_manager is not None:
-            self._connection_manager.close_all()
+            self._connection_manager.close()
 
         self._state = AppState.STOPPED
         self._shutdown_event.set()
@@ -361,7 +468,11 @@ class PokerHUDApp:
 
     def _setup_logging(self) -> None:
         """Configure logging based on the debug setting."""
-        level = logging.DEBUG if self._config.debug else logging.INFO
+        level = (
+            logging.DEBUG
+            if self._debug or self._config.general.debug
+            else logging.INFO
+        )
         logging.basicConfig(
             level=level,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -369,5 +480,25 @@ class PokerHUDApp:
         )
         logger.info(
             "Logging configured at %s level",
-            "DEBUG" if self._config.debug else "INFO",
+            "DEBUG" if level == logging.DEBUG else "INFO",
         )
+
+    @staticmethod
+    def _run_on_main_thread(block: Callable[[], None]) -> None:
+        """Schedule a callable to run on the main thread.
+
+        AppKit requires all UI mutations to happen on the main thread.
+        When called from a background thread (e.g. the capture pipeline),
+        this dispatches via libdispatch. When already on the main thread
+        it runs the block directly.
+        """
+        if threading.current_thread() is threading.main_thread():
+            block()
+            return
+
+        try:
+            from PyObjCTools.AppHelper import callAfter
+            callAfter(block)
+        except ImportError:
+            # No AppKit available (headless mode) — run inline
+            block()
