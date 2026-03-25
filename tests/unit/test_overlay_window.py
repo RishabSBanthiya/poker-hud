@@ -8,9 +8,12 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-from src.overlay.overlay_window import OverlayConfig, OverlayWindow
-
+from src.overlay.overlay_window import (
+    OverlayConfig,
+    OverlayWindow,
+    PanelType,
+    WindowInfo,
+)
 
 # ---------------------------------------------------------------------------
 # OverlayConfig tests
@@ -29,6 +32,7 @@ class TestOverlayConfig:
         assert cfg.font_size == 18.0
         assert cfg.text_color == (1.0, 1.0, 1.0, 1.0)
         assert cfg.bg_color == (0.0, 0.0, 0.0, 0.6)
+        assert cfg.opacity == 1.0
 
     def test_custom_values(self) -> None:
         cfg = OverlayConfig(x=100, y=200, width=300, height=40, font_size=14.0)
@@ -40,7 +44,29 @@ class TestOverlayConfig:
 
 
 # ---------------------------------------------------------------------------
-# OverlayWindow tests (mocked AppKit)
+# WindowInfo tests
+# ---------------------------------------------------------------------------
+
+
+class TestWindowInfo:
+    """Tests for the WindowInfo dataclass."""
+
+    def test_defaults(self) -> None:
+        info = WindowInfo()
+        assert info.x == 0.0
+        assert info.y == 0.0
+        assert info.width == 800.0
+        assert info.height == 600.0
+        assert info.title == ""
+
+    def test_custom_values(self) -> None:
+        info = WindowInfo(x=100, y=200, width=1024, height=768, title="PokerStars")
+        assert info.x == 100
+        assert info.title == "PokerStars"
+
+
+# ---------------------------------------------------------------------------
+# Mock helpers
 # ---------------------------------------------------------------------------
 
 
@@ -82,22 +108,42 @@ def mock_appkit():
         patch("src.overlay.overlay_window.NSColor") as mock_color,
         patch("src.overlay.overlay_window.NSFont") as mock_font,
         patch("src.overlay.overlay_window.NSMakeRect") as mock_make_rect,
+        patch("src.overlay.overlay_window.NSScreen") as mock_screen,
     ):
-        mock_nswindow_cls.alloc.return_value.initWithContentRect_styleMask_backing_defer_.return_value = (
-            mock_win
+        init_method = (
+            mock_nswindow_cls.alloc.return_value
+            .initWithContentRect_styleMask_backing_defer_
         )
-        mock_nstf_cls.alloc.return_value.initWithFrame_.return_value = mock_tf
+        init_method.return_value = mock_win
+        # Each alloc().initWithFrame_() call returns a new mock text field
+        panel_fields = [MagicMock() for _ in range(4)]
+        mock_nstf_cls.alloc.return_value.initWithFrame_.side_effect = [
+            mock_tf
+        ] + panel_fields
         mock_make_rect.side_effect = lambda x, y, w, h: (x, y, w, h)
+
+        # Mock screen for coordinate conversion
+        mock_screen_frame = MagicMock()
+        mock_screen_frame.size.height = 1080.0
+        mock_screen_frame.size.width = 1920.0
+        mock_screen.mainScreen.return_value.frame.return_value = mock_screen_frame
 
         yield {
             "window": mock_win,
             "text_field": mock_tf,
+            "panel_fields": panel_fields,
             "NSWindow": mock_nswindow_cls,
             "NSTextField": mock_nstf_cls,
             "NSColor": mock_color,
             "NSFont": mock_font,
             "NSMakeRect": mock_make_rect,
+            "NSScreen": mock_screen,
         }
+
+
+# ---------------------------------------------------------------------------
+# OverlayWindow init tests
+# ---------------------------------------------------------------------------
 
 
 class TestOverlayWindowInit:
@@ -117,6 +163,23 @@ class TestOverlayWindowInit:
     def test_is_visible_before_create(self) -> None:
         ow = OverlayWindow()
         assert ow.is_visible is False
+
+    def test_default_panels_initialized(self) -> None:
+        ow = OverlayWindow()
+        assert PanelType.STATS in ow.panels
+        assert PanelType.SOLVER in ow.panels
+        assert PanelType.SETTINGS in ow.panels
+        assert ow.panels[PanelType.STATS].visible is True
+        assert ow.panels[PanelType.SETTINGS].visible is False
+
+    def test_no_attached_window_initially(self) -> None:
+        ow = OverlayWindow()
+        assert ow.attached_window is None
+
+
+# ---------------------------------------------------------------------------
+# OverlayWindow create tests
+# ---------------------------------------------------------------------------
 
 
 class TestOverlayWindowCreate:
@@ -143,6 +206,13 @@ class TestOverlayWindowCreate:
             0.1, 0.2, 0.3, 0.8
         )
 
+    def test_create_sets_opacity(self, mock_appkit: dict) -> None:
+        cfg = OverlayConfig(opacity=0.7)
+        ow = OverlayWindow(config=cfg)
+        ow.create()
+
+        mock_appkit["window"].setAlphaValue_.assert_called_once_with(0.7)
+
     def test_create_configures_text_field(self, mock_appkit: dict) -> None:
         ow = OverlayWindow(text="VPIP: 24%")
         ow.create()
@@ -161,9 +231,13 @@ class TestOverlayWindowCreate:
         ow.create()
 
         content_view = mock_appkit["window"].contentView()
-        content_view.addSubview_.assert_called_once_with(
-            mock_appkit["text_field"]
-        )
+        # Main text field + 3 panel text fields
+        assert content_view.addSubview_.call_count == 4
+
+
+# ---------------------------------------------------------------------------
+# OverlayWindow actions tests
+# ---------------------------------------------------------------------------
 
 
 class TestOverlayWindowActions:
@@ -227,6 +301,108 @@ class TestOverlayWindowActions:
         ow.create()
         mock_appkit["window"].isVisible.return_value = True
         assert ow.is_visible is True
+
+
+# ---------------------------------------------------------------------------
+# Opacity tests
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayOpacity:
+    """Tests for opacity control."""
+
+    def test_set_opacity_updates_config(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        ow.set_opacity(0.5)
+        assert ow.config.opacity == 0.5
+        mock_appkit["window"].setAlphaValue_.assert_called_with(0.5)
+
+    def test_set_opacity_rejects_invalid(self) -> None:
+        ow = OverlayWindow()
+        with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+            ow.set_opacity(1.5)
+        with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+            ow.set_opacity(-0.1)
+
+
+# ---------------------------------------------------------------------------
+# Panel management tests
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayPanels:
+    """Tests for panel show/hide and content management."""
+
+    def test_show_panel(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        ow.hide_panel(PanelType.STATS)
+        assert ow.is_panel_visible(PanelType.STATS) is False
+        ow.show_panel(PanelType.STATS)
+        assert ow.is_panel_visible(PanelType.STATS) is True
+
+    def test_hide_panel(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        ow.hide_panel(PanelType.SOLVER)
+        assert ow.is_panel_visible(PanelType.SOLVER) is False
+
+    def test_set_panel_content(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        ow.set_panel_content(PanelType.STATS, "22/18/8/2.1")
+        assert ow.panels[PanelType.STATS].content == "22/18/8/2.1"
+
+    def test_is_panel_visible_unknown_panel(self) -> None:
+        ow = OverlayWindow()
+        # PanelType enum only has 3 values, so we test existing ones
+        assert ow.is_panel_visible(PanelType.SETTINGS) is False
+
+
+# ---------------------------------------------------------------------------
+# Window attachment tests
+# ---------------------------------------------------------------------------
+
+
+class TestOverlayAttachment:
+    """Tests for attaching to a poker window."""
+
+    def test_attach_to_window(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        info = WindowInfo(x=100, y=50, width=1024, height=768, title="PS")
+        ow.attach_to_window(info)
+
+        assert ow.attached_window is info
+        assert ow.config.x == 100.0
+        # y = screen_height(1080) - window_y(50) - overlay_height(60)
+        assert ow.config.y == 1080.0 - 50.0 - 60.0
+
+    def test_attach_updates_width(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        info = WindowInfo(x=0, y=0, width=1200, height=800)
+        ow.attach_to_window(info)
+        assert ow.config.width == 1200.0
+
+    def test_reposition_to_attached(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        info = WindowInfo(x=100, y=50, width=1024, height=768)
+        ow.attach_to_window(info)
+
+        # Simulate window move
+        info.x = 200
+        ow.update_attached_window(info)
+        assert ow.config.x == 200.0
+
+    def test_reposition_noop_without_attachment(self, mock_appkit: dict) -> None:
+        ow = OverlayWindow()
+        ow.create()
+        ow.reposition_to_attached()
+        # Should not raise, just do nothing
+        assert ow.attached_window is None
 
 
 @pytest.mark.requires_gui
