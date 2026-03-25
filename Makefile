@@ -1,4 +1,4 @@
-.PHONY: test lint format install dev clean
+.PHONY: test lint format format-check install dev clean check
 
 test:
 	python -m pytest tests/ -v
@@ -8,6 +8,11 @@ lint:
 
 format:
 	python -m black src/ tests/
+
+format-check:
+	python -m black --check src/ tests/
+
+check: lint format-check test
 
 install:
 	pip install -e .
