@@ -35,6 +35,7 @@ models/*.pth
 models/*.onnx
 data/raw/
 data/external/
+data/synthetic/
 
 # Logs
 logs/
