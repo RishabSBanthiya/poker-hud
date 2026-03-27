@@ -1,24 +1,24 @@
-"""PyTorch training harness for the card detection CNN.
+"""PyTorch training harness for the two-head rank+suit card CNN.
 
-Trains a lightweight CNN on the Kaggle cards-classification dataset
-and exports weights as a numpy ``.npz`` file compatible with
+Trains a CNN with a shared backbone and separate heads for rank
+(13 classes) and suit (4 classes) classification.  Exports weights
+as a numpy ``.npz`` file compatible with
 :class:`~src.detection.cnn_detector.CNNDetector`.
+
+Supports training on synthetic data from the synthetic generator
+and/or real card images.
 
 Usage::
 
-    python -m src.detection.train_cnn          # train with defaults
+    python -m src.detection.train_cnn --data-dir data/synthetic
     python -m src.detection.train_cnn --epochs 30 --lr 0.001
-
-The script expects the dataset at ``data/external/kaggle_cards_classification/``
-with subdirectories ``train/``, ``valid/``, ``test/`` each containing one folder
-per class (e.g. ``ace of spades/``, ``two of hearts/``, etc.).
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
-import random
 import sys
 from pathlib import Path
 
@@ -29,12 +29,10 @@ try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from PIL import Image
-    from torch.utils.data import ConcatDataset, DataLoader, Dataset
-    from torchvision import datasets, transforms
+    from torch.utils.data import DataLoader, Dataset, random_split
 except ImportError:
-    print("PyTorch and torchvision are required for training.")
-    print("Install with: pip3 install torch torchvision --break-system-packages")
+    print("PyTorch is required for training.")
+    print("Install with: pip3 install torch --break-system-packages")
     sys.exit(1)
 
 from src.detection.card import Rank, Suit
@@ -46,61 +44,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "external" / "kaggle_cards_classification"
+DATA_DIR = PROJECT_ROOT / "data" / "synthetic"
 MODEL_OUT = PROJECT_ROOT / "models" / "card_detector.npz"
 
 INPUT_SIZE = 64
-NUM_CLASSES = 52  # 52 standard cards, no joker
-NUM_FILTERS = 32
-KERNEL_SIZE = 5
+NUM_RANK_CLASSES = 13
+NUM_SUIT_CLASSES = 4
 
-# Map from Kaggle folder names → (Rank, Suit) for the 52 standard cards.
-# Order must match ``cnn_detector._ALL_CARDS``: suit-major, rank-minor.
-_ALL_CARDS: list[tuple[Rank, Suit]] = [
-    (rank, suit) for suit in Suit for rank in Rank
-]
-
-_RANK_FROM_NAME: dict[str, Rank] = {
-    "ace": Rank.ACE,
-    "two": Rank.TWO,
-    "three": Rank.THREE,
-    "four": Rank.FOUR,
-    "five": Rank.FIVE,
-    "six": Rank.SIX,
-    "seven": Rank.SEVEN,
-    "eight": Rank.EIGHT,
-    "nine": Rank.NINE,
-    "ten": Rank.TEN,
-    "jack": Rank.JACK,
-    "queen": Rank.QUEEN,
-    "king": Rank.KING,
-}
-
-_SUIT_FROM_NAME: dict[str, Suit] = {
-    "clubs": Suit.CLUBS,
-    "diamonds": Suit.DIAMONDS,
-    "hearts": Suit.HEARTS,
-    "spades": Suit.SPADES,
-}
-
-
-def _folder_to_index(folder_name: str) -> int | None:
-    """Convert a Kaggle folder name like ``'ace of spades'`` to class index.
-
-    Returns ``None`` for the joker class which is excluded.
-    """
-    parts = folder_name.strip().lower().split(" of ")
-    if len(parts) != 2:
-        return None  # "joker" or unexpected format
-    rank_str, suit_str = parts
-    rank = _RANK_FROM_NAME.get(rank_str)
-    suit = _SUIT_FROM_NAME.get(suit_str)
-    if rank is None or suit is None:
-        return None
-    try:
-        return _ALL_CARDS.index((rank, suit))
-    except ValueError:
-        return None
+ALL_RANKS: list[Rank] = list(Rank)
+ALL_SUITS: list[Suit] = list(Suit)
 
 
 # ---------------------------------------------------------------------------
@@ -108,118 +60,179 @@ def _folder_to_index(folder_name: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-class CardCNN(nn.Module):
-    """Minimal CNN matching the numpy inference in ``CNNDetector``.
+class TwoHeadCardCNN(nn.Module):
+    """Two-head CNN for rank and suit classification.
 
-    Architecture: Conv2d → ReLU → Flatten → Linear → (softmax at inference).
+    Architecture: shared backbone (3× Conv+BN+ReLU+MaxPool) with
+    separate FC heads for rank (13 classes) and suit (4 classes).
     """
 
-    def __init__(
-        self,
-        num_filters: int = NUM_FILTERS,
-        kernel_size: int = KERNEL_SIZE,
-        input_size: int = INPUT_SIZE,
-        num_classes: int = NUM_CLASSES,
-    ) -> None:
+    def __init__(self, input_size: int = INPUT_SIZE) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(1, num_filters, kernel_size, bias=True)
-        conv_out_size = input_size - kernel_size + 1
-        flat_size = num_filters * conv_out_size * conv_out_size
-        self.fc = nn.Linear(flat_size, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.conv1(x))
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1, bias=True)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1, bias=True)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1, bias=True)
+        self.bn3 = nn.BatchNorm2d(128)
+
+        pool_size = input_size // 8  # 3 rounds of MaxPool2d(2)
+        flat_size = 128 * pool_size * pool_size
+
+        self.rank_fc1 = nn.Linear(flat_size, 128)
+        self.rank_fc2 = nn.Linear(128, NUM_RANK_CLASSES)
+
+        self.suit_fc1 = nn.Linear(flat_size, 64)
+        self.suit_fc2 = nn.Linear(64, NUM_SUIT_CLASSES)
+
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Backbone
+        x = torch.max_pool2d(torch.relu(self.bn1(self.conv1(x))), 2)
+        x = torch.max_pool2d(torch.relu(self.bn2(self.conv2(x))), 2)
+        x = torch.max_pool2d(torch.relu(self.bn3(self.conv3(x))), 2)
         x = x.flatten(1)
-        return self.fc(x)
+
+        # Rank head
+        rank = self.dropout(torch.relu(self.rank_fc1(x)))
+        rank = self.rank_fc2(rank)
+
+        # Suit head
+        suit = self.dropout(torch.relu(self.suit_fc1(x)))
+        suit = self.suit_fc2(suit)
+
+        return rank, suit
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading
+# Dataset
 # ---------------------------------------------------------------------------
 
 
-def _build_label_remap(class_to_idx: dict[str, int]) -> dict[int, int]:
-    """Build a mapping from torchvision class indices to our 52-card indices.
+class SyntheticCardDataset(Dataset):
+    """Dataset loading synthetic corner crops from the generator output.
 
-    Entries whose folder name doesn't map (joker) are excluded.
+    Expects a directory with ``images/`` subdirectory and ``manifest.csv``
+    mapping filenames to rank and suit indices.
     """
-    remap: dict[int, int] = {}
-    for folder_name, tv_idx in class_to_idx.items():
-        card_idx = _folder_to_index(folder_name)
-        if card_idx is not None:
-            remap[tv_idx] = card_idx
-    return remap
 
+    def __init__(self, data_dir: Path, input_size: int = INPUT_SIZE) -> None:
+        self._data_dir = data_dir
+        self._input_size = input_size
+        self._items: list[tuple[Path, int, int]] = []
 
-class _RemappedDataset(torch.utils.data.Dataset):
-    """Wraps an ``ImageFolder`` dataset to remap labels and skip jokers."""
+        manifest_path = data_dir / "manifest.csv"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest not found at {manifest_path}. "
+                "Run: python -m src.detection.synthetic_generator"
+            )
 
-    def __init__(
-        self, base_dataset: datasets.ImageFolder, remap: dict[int, int]
-    ) -> None:
-        self._items = [
-            (path, remap[label])
-            for path, label in base_dataset.samples
-            if label in remap
-        ]
-        self._transform = base_dataset.transform
-        self._loader = base_dataset.loader
+        img_dir = data_dir / "images"
+        with open(manifest_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                filepath = img_dir / row["filename"]
+                if filepath.exists():
+                    self._items.append((
+                        filepath,
+                        int(row["rank_idx"]),
+                        int(row["suit_idx"]),
+                    ))
+
+        logger.info("Loaded %d samples from %s", len(self._items), data_dir)
 
     def __len__(self) -> int:
         return len(self._items)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
-        path, label = self._items[idx]
-        img = self._loader(path)
-        if self._transform is not None:
-            img = self._transform(img)
-        return img, label
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, int]:
+        filepath, rank_idx, suit_idx = self._items[idx]
+        img = cv2.imread(str(filepath), cv2.IMREAD_COLOR)
+        if img is None:
+            # Return a blank image on read failure
+            img = np.zeros(
+                (self._input_size, self._input_size, 3), dtype=np.uint8,
+            )
+
+        img = cv2.resize(
+            img, (self._input_size, self._input_size),
+            interpolation=cv2.INTER_AREA,
+        )
+        # HWC → CHW, normalise to [0, 1]
+        tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+        return tensor, rank_idx, suit_idx
 
 
-def _get_loaders(
-    data_dir: Path, batch_size: int
-) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Create train / validation / test data loaders."""
-    train_tf = transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),
-        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-        transforms.RandomRotation(10),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-    ])
-    eval_tf = transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),
-        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-        transforms.ToTensor(),
-    ])
+# ---------------------------------------------------------------------------
+# BatchNorm fusion for export
+# ---------------------------------------------------------------------------
 
-    train_ds = datasets.ImageFolder(str(data_dir / "train"), transform=train_tf)
-    valid_ds = datasets.ImageFolder(str(data_dir / "valid"), transform=eval_tf)
-    test_ds = datasets.ImageFolder(str(data_dir / "test"), transform=eval_tf)
 
-    remap = _build_label_remap(train_ds.class_to_idx)
-    logger.info("Mapped %d / %d classes to 52-card indices", len(remap), len(train_ds.class_to_idx))
+def _fuse_bn_conv(
+    conv: nn.Conv2d, bn: nn.BatchNorm2d,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fuse BatchNorm into Conv2d weights for inference.
 
-    train_loader = DataLoader(
-        _RemappedDataset(train_ds, remap),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
+    Returns fused (weight, bias) as numpy arrays.
+    """
+    w = conv.weight.data.clone()
+    b = conv.bias.data.clone()
+    mean = bn.running_mean
+    var = bn.running_var
+    gamma = bn.weight
+    beta = bn.bias
+    eps = bn.eps
+
+    scale = gamma / torch.sqrt(var + eps)
+    w_fused = w * scale.reshape(-1, 1, 1, 1)
+    b_fused = (b - mean) * scale + beta
+    return w_fused.detach().cpu().numpy(), b_fused.detach().cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+
+def _export_npz(model: TwoHeadCardCNN, path: Path) -> None:
+    """Save model weights as ``.npz`` for numpy-only inference.
+
+    Fuses BatchNorm into conv layers for efficient inference.
+    """
+    model.eval()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    conv1_w, conv1_b = _fuse_bn_conv(model.conv1, model.bn1)
+    conv2_w, conv2_b = _fuse_bn_conv(model.conv2, model.bn2)
+    conv3_w, conv3_b = _fuse_bn_conv(model.conv3, model.bn3)
+
+    state = model.state_dict()
+
+    np.savez(
+        str(path),
+        # Backbone (BN fused)
+        conv1_w=conv1_w,
+        conv1_b=conv1_b,
+        conv2_w=conv2_w,
+        conv2_b=conv2_b,
+        conv3_w=conv3_w,
+        conv3_b=conv3_b,
+        # Rank head (transposed for x @ W + b)
+        rank_fc1_w=state["rank_fc1.weight"].cpu().numpy().T,
+        rank_fc1_b=state["rank_fc1.bias"].cpu().numpy(),
+        rank_fc2_w=state["rank_fc2.weight"].cpu().numpy().T,
+        rank_fc2_b=state["rank_fc2.bias"].cpu().numpy(),
+        # Suit head (transposed for x @ W + b)
+        suit_fc1_w=state["suit_fc1.weight"].cpu().numpy().T,
+        suit_fc1_b=state["suit_fc1.bias"].cpu().numpy(),
+        suit_fc2_w=state["suit_fc2.weight"].cpu().numpy().T,
+        suit_fc2_b=state["suit_fc2.bias"].cpu().numpy(),
     )
-    valid_loader = DataLoader(
-        _RemappedDataset(valid_ds, remap),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-    test_loader = DataLoader(
-        _RemappedDataset(test_ds, remap),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-    return train_loader, valid_loader, test_loader
+    logger.info("Exported two-head weights to %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -228,70 +241,94 @@ def _get_loaders(
 
 
 def _train_epoch(
-    model: CardCNN,
+    model: TwoHeadCardCNN,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
+    """Train one epoch. Returns (loss, rank_acc, suit_acc, exact_acc)."""
     model.train()
     total_loss = 0.0
-    correct = 0
+    rank_correct = 0
+    suit_correct = 0
+    exact_correct = 0
     total = 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
+
+    for images, rank_labels, suit_labels in loader:
+        images = images.to(device)
+        rank_labels = rank_labels.to(device)
+        suit_labels = suit_labels.to(device)
+
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        rank_logits, suit_logits = model(images)
+
+        loss_rank = criterion(rank_logits, rank_labels)
+        loss_suit = criterion(suit_logits, suit_labels)
+        loss = loss_rank + loss_suit
+
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
-        correct += (outputs.argmax(1) == labels).sum().item()
+        rank_pred = rank_logits.argmax(1)
+        suit_pred = suit_logits.argmax(1)
+        rank_correct += (rank_pred == rank_labels).sum().item()
+        suit_correct += (suit_pred == suit_labels).sum().item()
+        exact_correct += (
+            (rank_pred == rank_labels) & (suit_pred == suit_labels)
+        ).sum().item()
         total += images.size(0)
 
-    return total_loss / total, correct / total
+    return (
+        total_loss / total,
+        rank_correct / total,
+        suit_correct / total,
+        exact_correct / total,
+    )
 
 
 @torch.no_grad()
 def _evaluate(
-    model: CardCNN,
+    model: TwoHeadCardCNN,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
+    """Evaluate model. Returns (loss, rank_acc, suit_acc, exact_acc)."""
     model.eval()
     total_loss = 0.0
-    correct = 0
+    rank_correct = 0
+    suit_correct = 0
+    exact_correct = 0
     total = 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+
+    for images, rank_labels, suit_labels in loader:
+        images = images.to(device)
+        rank_labels = rank_labels.to(device)
+        suit_labels = suit_labels.to(device)
+
+        rank_logits, suit_logits = model(images)
+        loss = criterion(rank_logits, rank_labels) + criterion(
+            suit_logits, suit_labels,
+        )
+
         total_loss += loss.item() * images.size(0)
-        correct += (outputs.argmax(1) == labels).sum().item()
+        rank_pred = rank_logits.argmax(1)
+        suit_pred = suit_logits.argmax(1)
+        rank_correct += (rank_pred == rank_labels).sum().item()
+        suit_correct += (suit_pred == suit_labels).sum().item()
+        exact_correct += (
+            (rank_pred == rank_labels) & (suit_pred == suit_labels)
+        ).sum().item()
         total += images.size(0)
 
-    return total_loss / total, correct / total
-
-
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-
-
-def _export_npz(model: CardCNN, path: Path) -> None:
-    """Save model weights as ``.npz`` for numpy-only inference."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state = model.state_dict()
-    np.savez(
-        str(path),
-        conv1_w=state["conv1.weight"].cpu().numpy(),
-        conv1_b=state["conv1.bias"].cpu().numpy(),
-        fc_w=state["fc.weight"].cpu().numpy().T,  # transpose for x @ W + b
-        fc_b=state["fc.bias"].cpu().numpy(),
+    return (
+        total_loss / total,
+        rank_correct / total,
+        suit_correct / total,
+        exact_correct / total,
     )
-    logger.info("Exported weights to %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +337,18 @@ def _export_npz(model: CardCNN, path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train card detection CNN")
+    parser = argparse.ArgumentParser(
+        description="Train two-head rank+suit card detection CNN",
+    )
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--output", type=Path, default=MODEL_OUT)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument(
+        "--val-split", type=float, default=0.15,
+        help="Fraction of data to use for validation (default: 0.15)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -315,7 +358,7 @@ def main() -> None:
 
     if not args.data_dir.is_dir():
         logger.error(
-            "Dataset not found at %s. See data/external/README.md for download instructions.",
+            "Dataset not found at %s. Run: python -m src.detection.synthetic_generator",
             args.data_dir,
         )
         sys.exit(1)
@@ -323,50 +366,60 @@ def main() -> None:
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    train_loader, valid_loader, test_loader = _get_loaders(
-        args.data_dir, args.batch_size
+    # Load dataset and split into train/val
+    full_dataset = SyntheticCardDataset(args.data_dir)
+    val_size = int(len(full_dataset) * args.val_split)
+    train_size = len(full_dataset) - val_size
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0,
     )
     logger.info(
-        "Dataset: %d train, %d valid, %d test samples",
-        len(train_loader.dataset),
-        len(valid_loader.dataset),
-        len(test_loader.dataset),
+        "Dataset: %d train, %d val samples",
+        len(train_ds), len(val_ds),
     )
 
-    model = CardCNN().to(device)
+    model = TwoHeadCardCNN().to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3
+        optimizer, mode="min", factor=0.5, patience=3,
     )
 
-    best_val_acc = 0.0
+    best_val_exact = 0.0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = _train_epoch(
-            model, train_loader, criterion, optimizer, device
+        train_loss, train_rank, train_suit, train_exact = _train_epoch(
+            model, train_loader, criterion, optimizer, device,
         )
-        val_loss, val_acc = _evaluate(model, valid_loader, criterion, device)
+        val_loss, val_rank, val_suit, val_exact = _evaluate(
+            model, val_loader, criterion, device,
+        )
         scheduler.step(val_loss)
 
         logger.info(
-            "Epoch %2d/%d  train_loss=%.4f train_acc=%.3f  val_loss=%.4f val_acc=%.3f",
+            "Epoch %2d/%d  loss=%.4f  "
+            "rank=%.3f/%.3f  suit=%.3f/%.3f  exact=%.3f/%.3f",
             epoch,
             args.epochs,
             train_loss,
-            train_acc,
-            val_loss,
-            val_acc,
+            train_rank,
+            val_rank,
+            train_suit,
+            val_suit,
+            train_exact,
+            val_exact,
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if val_exact > best_val_exact:
+            best_val_exact = val_exact
             _export_npz(model, args.output)
-            logger.info("  -> New best model saved (val_acc=%.3f)", val_acc)
+            logger.info("  -> New best model saved (exact=%.3f)", val_exact)
 
-    # Final test evaluation
-    test_loss, test_acc = _evaluate(model, test_loader, criterion, device)
-    logger.info("Test accuracy: %.3f (loss=%.4f)", test_acc, test_loss)
-    logger.info("Best validation accuracy: %.3f", best_val_acc)
+    logger.info("Best validation exact-match accuracy: %.3f", best_val_exact)
     logger.info("Model saved to %s", args.output)
 
 
